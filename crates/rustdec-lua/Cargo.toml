@@ -1,0 +1,16 @@
+[package]
+name        = "rustdec-plugin"
+description = "Lua plugin system for RustDec (stub)"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+rust-version.workspace = true
+
+[dependencies]
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+thiserror.workspace = true
+tracing.workspace   = true
+
+# RustDec crates exposed to Lua scripts via UserData (uncomment in V2)
+# rustdec-ir.workspace       = true
+# rustdec-analysis.workspace = true

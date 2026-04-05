@@ -307,7 +307,7 @@ fn lift_insn(insn: &Instruction, next_id: &mut u32) -> Vec<Stmt> {
 
 // ── Sub-lifters ───────────────────────────────────────────────────────────────
 
-fn lift_mov(dst: &str, src: &str, next_id: &mut u32) -> Vec<Stmt> {
+fn lift_mov(dst: &str, src: &str, _next_id: &mut u32) -> Vec<Stmt> {
     let src_val = operand_value(src);
     let src_ty  = value_type(&src_val);
 
@@ -333,7 +333,7 @@ fn lift_mov(dst: &str, src: &str, next_id: &mut u32) -> Vec<Stmt> {
     vec![Stmt::Assign { lhs: id, ty: dst_ty, rhs }]
 }
 
-fn lift_lea(dst: &str, src: &str, next_id: &mut u32) -> Vec<Stmt> {
+fn lift_lea(dst: &str, src: &str, _next_id: &mut u32) -> Vec<Stmt> {
     // lea dst, [base + offset]  →  dst = &expr
     // We model the address computation as an opaque u64 for now.
     let id = reg_id(dst);
@@ -344,7 +344,7 @@ fn lift_lea(dst: &str, src: &str, next_id: &mut u32) -> Vec<Stmt> {
     }]
 }
 
-fn lift_binop(mnem: &str, dst: &str, src: &str, next_id: &mut u32) -> Vec<Stmt> {
+fn lift_binop(mnem: &str, dst: &str, src: &str, _next_id: &mut u32) -> Vec<Stmt> {
     let op = match mnem {
         "add" | "adc" => BinOp::Add,
         "sub" | "sbb" => BinOp::Sub,
