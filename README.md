@@ -1,4 +1,4 @@
-# RustDec
+# Corpo Fractum
 
 **Binary decompiler written in 100% Rust — ELF · PE · Mach-O → C / C++ / Rust**
 
@@ -43,18 +43,15 @@ sudo dnf install gtk4-devel cairo-devel
 
 ### Build
 
-```bash
-git clone https://github.com/yourorg/rustdec
-cd rustdec
-cargo build --release
+```bashcargo build --release
 ```
 
 ### Run
 
 ```bash
-./target/release/rustdec
+./target/release/corpo_fractum
 # or with debug logging:
-RUSTDEC_LOG=debug ./target/release/rustdec
+RUSTDEC_LOG=debug ./target/release/corpo_fractum
 ```
 
 ### Tests
@@ -70,7 +67,7 @@ cargo test -p rustdec-disasm   # disassembler only
 ## Workspace layout
 
 ```
-rustdec/
+corpo_fractum/
 ├── Cargo.toml                  # workspace root
 ├── crates/
 │   ├── rustdec-loader/         # ELF / PE / Mach-O parser  (goblin)
@@ -117,4 +114,4 @@ rustdec-gui         (gtk4 + cairo + tokio)
 
 ## License
 
-MIT OR Apache-2.0
+GPL v3.0

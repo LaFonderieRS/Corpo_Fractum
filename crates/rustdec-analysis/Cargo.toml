@@ -10,6 +10,7 @@ rust-version.workspace = true
 rustdec-loader.workspace  = true
 rustdec-disasm.workspace  = true
 rustdec-ir.workspace      = true
+rustdec-lift.workspace    = true
 petgraph.workspace        = true
 rayon.workspace           = true
 thiserror.workspace       = true

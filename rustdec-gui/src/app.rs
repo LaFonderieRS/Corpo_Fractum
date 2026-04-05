@@ -69,7 +69,7 @@ pub fn activate(app: &Application, rt: Handle) {
     // ── Window ────────────────────────────────────────────────────────────────
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("RustDec")
+        .title("Corpo Fractum")
         .default_width(1400)
         .default_height(900)
         .child(&main_pane)

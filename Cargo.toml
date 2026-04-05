@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rustdec-loader",
+    "crates/rustdec-lift",
     "crates/rustdec-disasm",
     "crates/rustdec-ir",
     "crates/rustdec-analysis",
@@ -48,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustdec-loader   = { path = "crates/rustdec-loader" }
 rustdec-disasm   = { path = "crates/rustdec-disasm" }
 rustdec-ir       = { path = "crates/rustdec-ir" }
+rustdec-lift     = { path = "crates/rustdec-lift" }
 rustdec-analysis = { path = "crates/rustdec-analysis" }
 rustdec-codegen  = { path = "crates/rustdec-codegen" }
 
