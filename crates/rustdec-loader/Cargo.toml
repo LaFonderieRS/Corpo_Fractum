@@ -1,0 +1,17 @@
+[package]
+name        = "rustdec-loader"
+description = "Binary format parser (ELF, PE, Mach-O) for RustDec"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+rust-version.workspace = true
+
+[dependencies]
+goblin.workspace    = true
+thiserror.workspace = true
+anyhow.workspace    = true
+serde.workspace     = true
+tracing.workspace   = true
+
+[dev-dependencies]
+assert_matches = "1"

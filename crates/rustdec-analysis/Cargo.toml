@@ -1,0 +1,17 @@
+[package]
+name        = "rustdec-analysis"
+description = "CFG construction and static analysis for RustDec"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+rust-version.workspace = true
+
+[dependencies]
+rustdec-loader.workspace  = true
+rustdec-disasm.workspace  = true
+rustdec-ir.workspace      = true
+petgraph.workspace        = true
+rayon.workspace           = true
+thiserror.workspace       = true
+tracing.workspace         = true
+serde.workspace           = true

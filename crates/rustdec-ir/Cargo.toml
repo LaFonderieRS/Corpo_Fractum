@@ -1,0 +1,12 @@
+[package]
+name        = "rustdec-ir"
+description = "Intermediate representation (SSA IR) for RustDec"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+rust-version.workspace = true
+
+[dependencies]
+petgraph.workspace = true
+serde.workspace    = true
+thiserror.workspace = true

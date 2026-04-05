@@ -1,0 +1,74 @@
+/* RustDec — dark theme */
+
+window, .background {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+}
+
+.panel-header {
+    background-color: #181825;
+    color: #89b4fa;
+    font-weight: bold;
+    font-size: 12px;
+    padding: 6px 12px;
+    border-bottom: 1px solid #313244;
+}
+
+.function-list row {
+    padding: 2px 0;
+    border-radius: 4px;
+}
+
+.function-list row:selected {
+    background-color: #313244;
+    color: #cba6f7;
+}
+
+.function-list row:hover {
+    background-color: #45475a;
+}
+
+.code-view {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+    font-family: "JetBrains Mono", "Fira Code", "Source Code Pro", monospace;
+    font-size: 13px;
+}
+
+textview text {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+}
+
+paned > separator {
+    background-color: #313244;
+    min-width: 1px;
+    min-height: 1px;
+}
+
+headerbar {
+    background-color: #181825;
+    border-bottom: 1px solid #313244;
+    color: #cdd6f4;
+}
+
+headerbar button {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    padding: 4px 12px;
+}
+
+headerbar button:hover {
+    background-color: #45475a;
+}
+
+entry, searchentry {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    padding: 4px 8px;
+    margin: 4px;
+}

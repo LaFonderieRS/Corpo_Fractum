@@ -1,0 +1,29 @@
+[package]
+name        = "rustdec-gui"
+description = "GTK4 graphical interface for RustDec"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rustdec"
+path = "src/main.rs"
+
+[dependencies]
+rustdec-loader.workspace   = true
+rustdec-disasm.workspace   = true
+rustdec-ir.workspace       = true
+rustdec-analysis.workspace = true
+rustdec-codegen.workspace  = true
+
+gtk4          = { version = "0.9", features = ["v4_12"] }
+cairo-rs      = "0.20"
+glib          = "0.20"
+async-channel = "2"
+
+tokio.workspace  = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace  = true
+anyhow.workspace = true
