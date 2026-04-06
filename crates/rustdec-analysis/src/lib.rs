@@ -4,10 +4,12 @@
 //! instruction lifting, and CFG structuration.
 
 pub mod cfg;
+pub mod dominance;
 pub mod functions;
 pub mod structure;
 
 pub use cfg::build_cfg;
+pub use dominance::{DomTree, NaturalLoop, find_natural_loops, find_convergence};
 pub use functions::detect_functions;
 pub use structure::{structure_function, StructuredFunc, SNode, CondExpr};
 
