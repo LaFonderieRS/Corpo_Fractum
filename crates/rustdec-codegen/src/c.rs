@@ -1,10 +1,33 @@
 //! C99 pseudo-code backend — structured output using if/while/for.
 //!
-//! Uses [`StructuredFunc`] from `rustdec-analysis` to emit clean structured
-//! code instead of flat goto-based output.
+//! ## P1 improvements applied in this version
+//!
+//! ### Variable hoisting
+//! All SSA variable declarations (`uint64_t vN`) are collected in a first pass
+//! and emitted at the top of the function body, one per unique (id, type) pair.
+//! This produces valid C even when the structured tree visits a variable
+//! multiple times (e.g. after a loop back-edge).
+//!
+//! ### Copy-propagation
+//! Before emitting, we build a substitution table of trivial assignments of
+//! the form `vN = vM` (identity copies) or `vN = <const>`.  When emitting
+//! expressions, every `vN` that has a substitution is replaced inline.
+//! This eliminates the chains of temporaries the SSA lifter produces:
+//!
+//! ```c
+//! // Before:   uint64_t v12 = v4;  uint64_t v13 = v12;  foo(v13)
+//! // After:    foo(v4)
+//! ```
+//!
+//! The substitution is intentionally conservative:
+//! - Only pure `Expr::Value` RHS are propagated (no side-effects).
+//! - A variable is only substituted if it is assigned exactly once in the
+//!   whole function (checked via the use-count map built in the first pass).
+
+use std::collections::{HashMap, HashSet};
 
 use rustdec_analysis::{structure_function, CondExpr, SNode};
-use rustdec_ir::{BinOp, CallTarget, Expr, IrFunction, IrType, Stmt, Terminator, Value};
+use rustdec_ir::{BinOp, BasicBlock, CallTarget, Expr, IrFunction, IrType, Stmt, Terminator, Value};
 use tracing::{debug, trace, warn};
 
 use crate::{CodegenBackend, CodegenResult};
@@ -24,20 +47,70 @@ impl CodegenBackend for CBackend {
                 .collect::<Vec<_>>().join(", ")
         };
 
-        debug!(func = %func.name, ret = %ret, params = func.params.len(), "C: emitting function");
+        debug!(func = %func.name, ret = %ret, params = func.params.len(),
+               "C: emitting function");
 
+        let blocks: Vec<&BasicBlock> = func.blocks_sorted();
+
+        // ── Pass 1: collect variables, copy table, and written-var set ─────────
+        let mut var_decls: HashMap<u32, IrType> = HashMap::new();
+        let mut assign_count: HashMap<u32, usize> = HashMap::new();
+        // Maps vN → Value when vN = <pure copy>
+        let mut copy_table: HashMap<u32, Value> = HashMap::new();
+        // SSA IDs that were explicitly written somewhere in this function.
+        // Used to filter spurious ABI placeholder arguments from calls.
+        let mut written_vars: HashSet<u32> = HashSet::new();
+
+        for bb in &blocks {
+            for stmt in &bb.stmts {
+                if let Stmt::Assign { lhs, ty, rhs } = stmt {
+                    var_decls.entry(*lhs).or_insert_with(|| ty.clone());
+                    *assign_count.entry(*lhs).or_insert(0) += 1;
+                    written_vars.insert(*lhs);
+                    if let Expr::Value(v) = rhs {
+                        copy_table.insert(*lhs, v.clone());
+                    }
+                }
+            }
+        }
+
+        // Only propagate variables assigned exactly once (safe in SSA).
+        copy_table.retain(|id, _| assign_count.get(id).copied().unwrap_or(0) == 1);
+
+        // Flatten the copy table transitively (vA→vB→vC becomes vA→vC).
+        let copy_table = flatten_copies(copy_table);
+
+        // Variables that are copy-propagated away don't need declarations.
+        let suppressed: HashSet<u32> = copy_table.keys().copied().collect();
+
+        // ── Emit function header ──────────────────────────────────────────────
         let mut out = String::new();
         out.push_str(&format!("// RustDec decompilation — {}\n", func.name));
         out.push_str(&format!("{ret} {}({params}) {{\n", sanitise_name(&func.name)));
 
-        // Build structured tree.
-        let structured = structure_function(func);
+        // ── Emit variable declarations (hoisted) ──────────────────────────────
+        let mut decl_lines: Vec<String> = var_decls
+            .iter()
+            .filter(|(id, _)| !suppressed.contains(id))
+            .map(|(id, ty)| format!("  {} v{id};", self.emit_type(ty)))
+            .collect();
+        decl_lines.sort(); // deterministic output
+        if !decl_lines.is_empty() {
+            for line in &decl_lines {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
 
-        // Emit structured tree.
-        self.emit_node(&structured.root, &structured, &mut out, 1);
+        // ── Emit structured body ──────────────────────────────────────────────
+        let structured = structure_function(func);
+        self.emit_node(&structured.root, &structured, &copy_table, &written_vars, &mut out, 1);
 
         out.push_str("}\n");
-        debug!(func = %func.name, lines = out.lines().count(), "C: function emitted");
+        debug!(func = %func.name, lines = out.lines().count(),
+               vars = var_decls.len(), propagated = suppressed.len(),
+               "C: function emitted");
         Ok(out)
     }
 
@@ -65,6 +138,39 @@ impl CodegenBackend for CBackend {
     }
 }
 
+// ── Copy-propagation helper ───────────────────────────────────────────────────
+
+/// Flatten a copy table transitively.
+///
+/// If `table[A] = Var(B)` and `table[B] = Var(C)`, replace both with `Var(C)`.
+/// Stops after 16 iterations to guard against cycles (shouldn't happen in SSA).
+fn flatten_copies(mut table: HashMap<u32, Value>) -> HashMap<u32, Value> {
+    for _ in 0..16 {
+        let mut changed = false;
+        let snapshot = table.clone();
+        for val in table.values_mut() {
+            if let Value::Var { id, .. } = val {
+                if let Some(deeper) = snapshot.get(id) {
+                    *val = deeper.clone();
+                    changed = true;
+                }
+            }
+        }
+        if !changed { break; }
+    }
+    table
+}
+
+/// Resolve a `Value` through the copy-propagation table.
+fn resolve<'a>(v: &'a Value, copies: &'a HashMap<u32, Value>) -> &'a Value {
+    if let Value::Var { id, .. } = v {
+        if let Some(subst) = copies.get(id) {
+            return resolve(subst, copies); // one level of recursion is safe post-flatten
+        }
+    }
+    v
+}
+
 // ── Structured tree emitter ───────────────────────────────────────────────────
 
 impl CBackend {
@@ -74,50 +180,52 @@ impl CBackend {
 
     fn emit_node(
         &self,
-        node:       &SNode,
-        sfunc:      &rustdec_analysis::StructuredFunc,
-        out:        &mut String,
-        depth:      usize,
+        node:    &SNode,
+        sfunc:   &rustdec_analysis::StructuredFunc,
+        copies:  &HashMap<u32, Value>,
+        written: &HashSet<u32>,
+        out:     &mut String,
+        depth:   usize,
     ) {
         let ind = Self::indent(depth);
         match node {
             SNode::Block(id) => {
                 if let Some(bb) = sfunc.blocks.get(id) {
-                    trace!(block = format_args!("{:#x}", bb.start_addr), stmts = bb.stmts.len(), "C: emit block");
+                    trace!(block = format_args!("{:#x}", bb.start_addr),
+                           stmts = bb.stmts.len(),
+                           "C: emit block");
                     for stmt in &bb.stmts {
-                        let s = self.emit_stmt(stmt);
-                        if s != "/* nop */" {
-                            out.push_str(&format!("{ind}{};\n", s));
+                        if let Some(line) = self.emit_stmt_opt(stmt, copies, written) {
+                            out.push_str(&format!("{ind}{line};\n"));
                         }
                     }
-                    // Emit return if this block terminates the function.
-                    if let Terminator::Return(val) = &bb.terminator {
-                        if let Some(v) = val {
-                            out.push_str(&format!("{ind}return {};\n", v.display()));
-                        } else if !matches!(sfunc.blocks.values()
-                            .filter(|b| matches!(b.terminator, Terminator::Return(_)))
-                            .count(), 0)
-                        {
-                            // Only emit bare return if this is a void function.
-                            // For non-void, the rax assignment above already carries the value.
+                    // Return statement — value already patched by lifter.
+                    match &bb.terminator {
+                        Terminator::Return(Some(v)) => {
+                            let resolved = resolve(v, copies);
+                            out.push_str(&format!("{ind}return {};\n",
+                                                  resolved.display()));
                         }
+                        Terminator::Return(None) => {
+                            out.push_str(&format!("{ind}return;\n"));
+                        }
+                        _ => {}
                     }
                 }
             }
 
             SNode::Seq(nodes) => {
                 for n in nodes {
-                    self.emit_node(n, sfunc, out, depth);
+                    self.emit_node(n, sfunc, copies, written, out, depth);
                 }
             }
 
             SNode::IfElse { cond, then, else_ } => {
-                let cond_str = self.emit_cond(cond, sfunc);
+                let cond_str = self.emit_cond(cond, sfunc, copies, written);
                 out.push_str(&format!("{ind}if ({cond_str}) {{\n"));
-                self.emit_node(then, sfunc, out, depth + 1);
-                // Only emit else if non-empty.
+                self.emit_node(then, sfunc, copies, written, out, depth + 1);
                 let mut else_buf = String::new();
-                self.emit_node(else_, sfunc, &mut else_buf, depth + 1);
+                self.emit_node(else_, sfunc, copies, written, &mut else_buf, depth + 1);
                 if !else_buf.trim().is_empty() {
                     out.push_str(&format!("{ind}}} else {{\n"));
                     out.push_str(&else_buf);
@@ -126,9 +234,9 @@ impl CBackend {
             }
 
             SNode::Loop { cond, body } => {
-                let cond_str = self.emit_cond(cond, sfunc);
+                let cond_str = self.emit_cond(cond, sfunc, copies, written);
                 out.push_str(&format!("{ind}while ({cond_str}) {{\n"));
-                self.emit_node(body, sfunc, out, depth + 1);
+                self.emit_node(body, sfunc, copies, written, out, depth + 1);
                 out.push_str(&format!("{ind}}}\n"));
             }
 
@@ -137,106 +245,169 @@ impl CBackend {
         }
     }
 
-    /// Emit a human-readable condition string for a Branch block.
+    /// Emit one statement, or `None` if it should be suppressed.
     ///
-    /// We look up the last `cmp`/`test` stmt in the block and combine it
-    /// with the branch mnemonic to produce e.g. `v3 != 0` or `v1 < v2`.
-    fn emit_cond(&self, cond: &CondExpr, sfunc: &rustdec_analysis::StructuredFunc) -> String {
-        // Find the block by address.
+    /// Assignments of the form `vN = vM` where `vN` is in the copy table
+    /// are suppressed entirely — the substitution happens at use-sites.
+    /// `Stmt::Nop` is always suppressed.
+    fn emit_stmt_opt(
+        &self,
+        stmt:   &Stmt,
+        copies: &HashMap<u32, Value>,
+        written: &HashSet<u32>,
+    ) -> Option<String> {
+        match stmt {
+            Stmt::Nop => None,
+
+            Stmt::Assign { lhs, ty: _, rhs } => {
+                // Suppress if this variable is copy-propagated away.
+                if copies.contains_key(lhs) {
+                    return None;
+                }
+                let rhs_str = self.emit_expr_resolved(rhs, copies, written);
+                // Emit as assignment (no type — variables are declared at top).
+                Some(format!("v{lhs} = {rhs_str}"))
+            }
+
+            Stmt::Store { ptr, val } => {
+                let ptr_r = resolve(ptr, copies);
+                let val_r = resolve(val, copies);
+                Some(format!("*({}) = {}", ptr_r.display(), val_r.display()))
+            }
+        }
+    }
+
+    /// Emit a condition expression for `if`/`while` headers.
+    fn emit_cond(
+        &self,
+        cond:    &CondExpr,
+        sfunc:   &rustdec_analysis::StructuredFunc,
+        copies:  &HashMap<u32, Value>,
+        _written: &HashSet<u32>,
+    ) -> String {
         let bb = sfunc.blocks.values()
             .find(|b| b.start_addr == cond.block_addr);
 
         if let Some(bb) = bb {
-            // Find last cmp/test assignment.
-            let cmp_stmt = bb.stmts.iter().rev().find(|s| {
-                matches!(s, Stmt::Assign { rhs: Expr::BinOp { op: BinOp::Sub | BinOp::And, .. }, .. })
+            // Find the last cmp/test — it produced the flag variable.
+            let cmp = bb.stmts.iter().rev().find(|s| {
+                matches!(s, Stmt::Assign {
+                    rhs: Expr::BinOp { op: BinOp::Sub | BinOp::And, .. }, ..
+                })
             });
 
-            if let Some(Stmt::Assign { lhs, rhs: Expr::BinOp { lhs: l, rhs: r, op }, .. }) = cmp_stmt {
-                let lhs_s = l.display();
-                let rhs_s = r.display();
-                let (rel, negate) = branch_mnem_to_rel(&bb, &cond.branch_mnem);
+            if let Some(Stmt::Assign { rhs: Expr::BinOp { lhs: l, rhs: r, .. }, .. }) = cmp {
+                let lhs_r = resolve(l, copies);
+                let rhs_r = resolve(r, copies);
+                let (rel, negate) = branch_mnem_to_rel(&cond.branch_mnem);
                 let negated = if cond.negate { !negate } else { negate };
                 return if negated {
-                    format!("!({lhs_s} {rel} {rhs_s})")
+                    format!("!({} {rel} {})", lhs_r.display(), rhs_r.display())
                 } else {
-                    format!("{lhs_s} {rel} {rhs_s}")
+                    format!("{} {rel} {}", lhs_r.display(), rhs_r.display())
                 };
             }
         }
 
-        // Fallback: emit opaque condition referencing the block address.
         format!("cond_{:x}", cond.block_addr)
     }
 
-    // ── Statement / expression emitters (unchanged from before) ──────────────
+    // ── Expression emitters ───────────────────────────────────────────────────
 
-    fn emit_stmt(&self, stmt: &Stmt) -> String {
-        match stmt {
-            Stmt::Assign { lhs, ty, rhs } => {
-                format!("{} v{lhs} = {}", self.emit_type(ty), self.emit_expr(rhs))
-            }
-            Stmt::Store { ptr, val } => {
-                format!("*({}) = {}", ptr.display(), val.display())
-            }
-            Stmt::Nop => "/* nop */".into(),
-        }
-    }
-
-    fn emit_expr(&self, expr: &Expr) -> String {
+    fn emit_expr_resolved(
+        &self,
+        expr:    &Expr,
+        copies:  &HashMap<u32, Value>,
+        written: &HashSet<u32>,
+    ) -> String {
         match expr {
-            Expr::Value(v) => v.display(),
+            Expr::Value(v) => resolve(v, copies).display(),
+
             Expr::BinOp { op, lhs, rhs } => {
-                format!("({} {} {})", lhs.display(), binop_c(op), rhs.display())
+                let l = resolve(lhs, copies);
+                let r = resolve(rhs, copies);
+                format!("({} {} {})", l.display(), binop_c(op), r.display())
             }
+
             Expr::Load { ptr, ty } => {
-                format!("*({}*){}", self.emit_type(ty), ptr.display())
+                let p = resolve(ptr, copies);
+                format!("*({}*){}", self.emit_type(ty), p.display())
             }
+
             Expr::Call { target, args, .. } => {
                 let tgt = match target {
                     CallTarget::Direct(a)   => format!("sub_{a:x}"),
                     CallTarget::Named(n)    => n.clone(),
                     CallTarget::Indirect(v) => {
-                        warn!(ptr = %v.display(), "C: indirect call");
-                        format!("(*(void*(*)(...))({}))", v.display())
+                        let r = resolve(v, copies);
+                        warn!(ptr = %r.display(), "C: indirect call");
+                        format!("(*(void*(*)(...))({}))", r.display())
                     }
                 };
-                // Filter out repeated rdi/rsi/rdx placeholder args — only emit
-                // non-trivial args (non-zero or non-register vars with id < 8).
-                let args_str = args.iter()
-                    .filter(|a| !matches!(a, Value::Const { val: 0, .. }))
-                    .map(|a| a.display())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{tgt}({args_str})")
+                // P2 — use-def argument filtering.
+                //
+                // The lifter always passes the 6 SysV ABI registers (rdi, rsi,
+                // rdx, rcx, r8, r9) as arguments to every call, regardless of
+                // whether the callee actually uses them.  After copy-propagation
+                // these resolve to their SSA IDs at the point of the call.
+                //
+                // An argument is considered "real" (i.e. intentionally set before
+                // this call) if, after resolution, it refers to a variable that
+                // was written somewhere in the current function.  Arguments that
+                // resolve to a Const are always real.  Arguments that resolve to
+                // a Var whose ID was never written in this function are ABI
+                // placeholders and are suppressed.
+                let filtered: Vec<String> = args
+                    .iter()
+                    .filter_map(|a| {
+                        let r = resolve(a, copies);
+                        match r {
+                            Value::Const { .. } => Some(r.display()),
+                            Value::Var { id, .. } => {
+                                if written.contains(id) {
+                                    Some(r.display())
+                                } else {
+                                    // Unwritten ABI register — suppress.
+                                    None
+                                }
+                            }
+                        }
+                    })
+                    .collect();
+                format!("{tgt}({})", filtered.join(", "))
             }
+
             Expr::Cast { val, to } => {
-                format!("({}){}", self.emit_type(to), val.display())
+                let v = resolve(val, copies);
+                format!("({}){}", self.emit_type(to), v.display())
             }
-            Expr::Opaque(s) => s.clone(),
+
+            Expr::Opaque(s) => {
+                // Opaque expressions come from unmodelled instructions or
+                // address computations that could not be reduced to IR.
+                // Emit as a line comment so the C remains syntactically valid
+                // (the surrounding emit_stmt_opt wraps this in a statement).
+                format!("/* {s} */")
+            }
         }
     }
 }
 
 // ── Branch mnemonic → relational operator ────────────────────────────────────
 
-/// Return `(operator_str, negate)` for a branch mnemonic.
-/// `negate=true` means the condition in the `if` should be inverted.
-fn branch_mnem_to_rel(bb: &rustdec_ir::BasicBlock, mnem: &str) -> (&'static str, bool) {
-    // The branch mnem is the last branch instruction in the block.
-    // We peek at the terminator to recover the original mnemonic.
+fn branch_mnem_to_rel(mnem: &str) -> (&'static str, bool) {
     match mnem {
-        "je"  | "jz"  => ("==", false),
-        "jne" | "jnz" => ("!=", false),
-        "jl"  | "jnge"=> ("<",  false),
-        "jle" | "jng" => ("<=", false),
-        "jg"  | "jnle"=> (">",  false),
-        "jge" | "jnl" => (">=", false),
-        "jb"  | "jnae"=> ("<",  false), // unsigned
-        "jbe" | "jna" => ("<=", false),
-        "ja"  | "jnbe"=> (">",  false),
-        "jae" | "jnb" => (">=", false),
-        _             => ("!=", false), // safe default
+        "je"  | "jz"   => ("==", false),
+        "jne" | "jnz"  => ("!=", false),
+        "jl"  | "jnge" => ("<",  false),
+        "jle" | "jng"  => ("<=", false),
+        "jg"  | "jnle" => (">",  false),
+        "jge" | "jnl"  => (">=", false),
+        "jb"  | "jnae" => ("<",  false),
+        "jbe" | "jna"  => ("<=", false),
+        "ja"  | "jnbe" => (">",  false),
+        "jae" | "jnb"  => (">=", false),
+        _              => ("!=", false),
     }
 }
 

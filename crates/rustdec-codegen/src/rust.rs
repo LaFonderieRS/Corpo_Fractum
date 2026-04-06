@@ -133,8 +133,8 @@ impl RustBackend {
             Terminator::Return(Some(v)) => format!("return {}", v.display()),
             Terminator::Return(None)    => "return".into(),
             Terminator::Jump(id)        => format!("// goto block_{id:x}"),
-            Terminator::Branch { cond, true_bb, false_bb } => format!(
-                "if {} != 0 {{ /* goto block_{true_bb:x} */ }} else {{ /* goto block_{false_bb:x} */ }}",
+            Terminator::Branch { cond, _true_bb, _false_bb, .. } => format!(
+                "if {} != 0 {{ /* goto block_{_true_bb:x} */ }} else {{ /* goto block_{_false_bb:x} */ }}",
                 cond.display()
             ),
             Terminator::Unreachable => "unreachable!()".into(),

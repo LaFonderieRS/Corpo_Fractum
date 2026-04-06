@@ -195,8 +195,12 @@ pub fn build_cfg(
             let from = bb.start_addr;
             bb.terminator = Terminator::Branch {
                 cond:     Value::Const { val: 0, ty: IrType::UInt(8) }, // placeholder
-                true_bb:  0,
-                false_bb: 0,
+                _true_bb:  0,
+                _false_bb: 0,
+                // Preserve the exact branch mnemonic so codegen can emit the
+                // correct relational operator (je→==, jl→<, jge→>=, etc.)
+                // without re-reading the instruction stream.
+                mnemonic: insn.mnemonic.clone(),
             };
             pending_branches.push((from, true_target, fall_through));
             let closed = current_block.take().unwrap();
@@ -258,12 +262,13 @@ pub fn build_cfg(
             let true_bid  = addr_to_blockid.get(true_addr).copied().unwrap_or(0);
             let false_bid = addr_to_blockid.get(false_addr).copied().unwrap_or(0);
 
-            // Patch the placeholder Branch.
-            if let Terminator::Branch { true_bb, false_bb, .. } =
+            // Patch the placeholder block IDs — mnemonic was set in pass 2,
+            // leave it unchanged.
+            if let Terminator::Branch { _true_bb, _false_bb, .. } =
                 &mut func.cfg[fni].terminator
             {
-                *true_bb  = true_bid;
-                *false_bb = false_bid;
+                *_true_bb  = true_bid;
+                *_false_bb = false_bid;
             }
 
             trace!(func  = %name,

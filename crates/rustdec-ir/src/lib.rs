@@ -136,7 +136,16 @@ pub enum Terminator {
     /// Unconditional jump to a block.
     Jump(BlockId),
     /// Conditional branch.
-    Branch { cond: Value, true_bb: BlockId, false_bb: BlockId },
+    ///
+    /// `mnemonic` is the original x86 branch instruction (`"je"`, `"jne"`,
+    /// `"jl"`, ...) preserved from disassembly so codegen can emit
+    /// the correct relational operator without re-reading the instruction stream.
+    Branch {
+        cond:     Value,
+        _true_bb:  BlockId,
+        _false_bb: BlockId,
+        mnemonic: String,
+    },
     /// Return from function.
     Return(Option<Value>),
     /// Unreachable (e.g. after `ud2`, `hlt`).
