@@ -1,11 +1,21 @@
 //! Application activation — builds the main window and wires up the UI.
 
+#[cfg(all(feature = "console-bottom", feature = "console-tab"))]
+compile_error!(
+    "features `console-bottom` and `console-tab` are mutually exclusive — pick one"
+);
+
 use glib;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, HeaderBar,
     Orientation, Paned,
 };
+#[cfg(feature = "console-tab")]
+use gtk4::{Label, Notebook};
+
+#[cfg(any(feature = "console-bottom", feature = "console-tab"))]
+use crate::ui::console::ConsolePanel;
 use tokio::runtime::Handle;
 
 use crate::bridge::{AnalysisBridge, BridgeEvent};
@@ -66,12 +76,37 @@ pub fn activate(app: &Application, rt: Handle) {
     // ── Layout: horizontal Paned (explorer | vertical Paned (code | graph)) ──
     let right_pane = Paned::new(Orientation::Vertical);
     right_pane.set_start_child(Some(code_view.widget()));
+
+    // Option B: graph slot becomes a GtkNotebook with Graph + Console tabs.
+    #[cfg(feature = "console-tab")]
+    {
+        let console = ConsolePanel::new(bridge.clone());
+        let notebook = Notebook::new();
+        notebook.append_page(graph_view.widget(), Some(&Label::new(Some("Graph"))));
+        notebook.append_page(console.widget(), Some(&Label::new(Some("Console"))));
+        right_pane.set_end_child(Some(&notebook));
+    }
+    #[cfg(not(feature = "console-tab"))]
     right_pane.set_end_child(Some(graph_view.widget()));
+
     right_pane.set_position(500);
 
     let main_pane = Paned::new(Orientation::Horizontal);
     main_pane.set_start_child(Some(explorer.widget()));
+
+    // Option A: console goes below the code+graph pane in an outer vertical split.
+    #[cfg(feature = "console-bottom")]
+    {
+        let console = ConsolePanel::new(bridge.clone());
+        let outer_right = Paned::new(Orientation::Vertical);
+        outer_right.set_start_child(Some(&right_pane));
+        outer_right.set_end_child(Some(console.widget()));
+        outer_right.set_position(600);
+        main_pane.set_end_child(Some(&outer_right));
+    }
+    #[cfg(not(feature = "console-bottom"))]
     main_pane.set_end_child(Some(&right_pane));
+
     main_pane.set_position(240);
 
     // ── Header bar ────────────────────────────────────────────────────────────

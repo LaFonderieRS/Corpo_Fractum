@@ -88,6 +88,18 @@ RUSTDEC_LOG=debug ./target/release/corpo_fractum
 RUSTDEC_LOG=rustdec_analysis=debug,info ./target/release/corpo_fractum
 ```
 
+New feature, the console :
+
+```bash                                                                                                                                                                             
+cargo build --release
+
+# With bottom console panel (below code + graph):
+cargo build --release --features console-bottom
+
+# With tabbed console panel (Console tab next to Graph):
+cargo build --release --features console-tab
+```
+
 ### Tests
 
 ```bash

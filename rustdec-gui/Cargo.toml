@@ -10,6 +10,10 @@ rust-version.workspace = true
 name = "rustdec"
 path = "src/main.rs"
 
+[features]
+console-bottom = []
+console-tab    = []
+
 [dependencies]
 rustdec-loader.workspace   = true
 rustdec-disasm.workspace   = true
