@@ -212,7 +212,7 @@ impl CBackend {
         sfunc:   &rustdec_analysis::StructuredFunc,
         copies:  &HashMap<u32, Value>,
         written: &HashSet<u32>,
-        slots:   &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
+        _slots:  &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
         out:     &mut String,
         depth:   usize,
     ) {
@@ -224,7 +224,7 @@ impl CBackend {
                            stmts = bb.stmts.len(),
                            "C: emit block");
                     for stmt in &bb.stmts {
-                        if let Some(line) = self.emit_stmt_opt(stmt, copies, written, slots) {
+                        if let Some(line) = self.emit_stmt_opt(stmt, copies, written, _slots) {
                             out.push_str(&format!("{ind}{line};\n"));
                         }
                     }
@@ -245,16 +245,16 @@ impl CBackend {
 
             SNode::Seq(nodes) => {
                 for n in nodes {
-                    self.emit_node(n, sfunc, copies, written, slots, out, depth);
+                    self.emit_node(n, sfunc, copies, written, _slots, out, depth);
                 }
             }
 
             SNode::IfElse { cond, then, else_ } => {
-                let cond_str = self.emit_cond(cond, sfunc, copies, written, slots);
+                let cond_str = self.emit_cond(cond, sfunc, copies, written, _slots);
                 out.push_str(&format!("{ind}if ({cond_str}) {{\n"));
-                self.emit_node(then, sfunc, copies, written, slots, out, depth + 1);
+                self.emit_node(then, sfunc, copies, written, _slots, out, depth + 1);
                 let mut else_buf = String::new();
-                self.emit_node(else_, sfunc, copies, written, slots, &mut else_buf, depth + 1);
+                self.emit_node(else_, sfunc, copies, written, _slots, &mut else_buf, depth + 1);
                 if !else_buf.trim().is_empty() {
                     out.push_str(&format!("{ind}}} else {{\n"));
                     out.push_str(&else_buf);
@@ -263,9 +263,9 @@ impl CBackend {
             }
 
             SNode::Loop { cond, body } => {
-                let cond_str = self.emit_cond(cond, sfunc, copies, written, slots);
+                let cond_str = self.emit_cond(cond, sfunc, copies, written, _slots);
                 out.push_str(&format!("{ind}while ({cond_str}) {{\n"));
-                self.emit_node(body, sfunc, copies, written, slots, out, depth + 1);
+                self.emit_node(body, sfunc, copies, written, _slots, out, depth + 1);
                 out.push_str(&format!("{ind}}}\n"));
             }
 
@@ -284,7 +284,7 @@ impl CBackend {
         stmt:   &Stmt,
         copies: &HashMap<u32, Value>,
         written: &HashSet<u32>,
-        slots:   &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
+        _slots:  &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
     ) -> Option<String> {
         match stmt {
             Stmt::Nop => None,
@@ -294,7 +294,7 @@ impl CBackend {
                 if copies.contains_key(lhs) {
                     return None;
                 }
-                let rhs_str = self.emit_expr_resolved(rhs, copies, written, slots);
+                let rhs_str = self.emit_expr_resolved(rhs, copies, written, _slots);
                 // Emit as assignment (no type — variables are declared at top).
                 // Slot vars are never assigned to directly (they are addressed
                 // via their pointer), so we suppress them here.
@@ -311,7 +311,7 @@ impl CBackend {
                 if let Value::Var { id, .. } = ptr_r {
                     if is_slot_id(*id) {
                         let offset = slot_id_to_offset(*id);
-                        if let Some(slot) = slots.get(&offset) {
+                        if let Some(slot) = _slots.get(&offset) {
                             return Some(format!("{} = {}", slot.name, val_r.display()));
                         }
                     }
@@ -328,7 +328,7 @@ impl CBackend {
         sfunc:   &rustdec_analysis::StructuredFunc,
         copies:  &HashMap<u32, Value>,
         _written: &HashSet<u32>,
-        slots:   &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
+        _slots:  &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
     ) -> String {
         let bb = sfunc.blocks.values()
             .find(|b| b.start_addr == cond.block_addr);
@@ -364,7 +364,7 @@ impl CBackend {
         expr:    &Expr,
         copies:  &HashMap<u32, Value>,
         written: &HashSet<u32>,
-        slots:   &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
+        _slots:  &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
     ) -> String {
         match expr {
             Expr::Value(v) => resolve(v, copies).display(),
@@ -376,12 +376,12 @@ impl CBackend {
             }
 
             Expr::Load { ptr, ty } => {
-                let p = display_value(ptr, copies, slots);
+                let p = display_value(ptr, copies, _slots);
                 // If the ptr is a slot reference, emit as named variable access.
                 if let Value::Var { id, .. } = resolve(ptr, copies) {
                     if is_slot_id(*id) {
                         let offset = slot_id_to_offset(*id);
-                        if let Some(slot) = slots.get(&offset) {
+                        if let Some(slot) = _slots.get(&offset) {
                             return slot.name.clone();
                         }
                     }
@@ -449,7 +449,7 @@ impl CBackend {
                 // Emit as a C string literal with proper escaping.
                 // If the string_table has a higher-fidelity version, use it.
                 let text = self.string_table.get(addr).unwrap_or(content);
-                format!(""{}"", escape_c_string(text))
+                format!("\"{}\"", escape_c_string(text))
             }
         }
     }

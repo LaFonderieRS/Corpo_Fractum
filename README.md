@@ -1,28 +1,57 @@
-# Corpo Fractum
+ ██████╗ ██████╗ ██████╗ ██████╗  ██████╗     ███████╗██████╗  █████╗  ██████╗████████╗██╗   ██╗███╗   ███╗
+██╔════╝██╔═══██╗██╔══██╗██╔══██╗██╔═══██╗    ██╔════╝██╔══██╗██╔══██╗██╔════╝╚══██╔══╝██║   ██║████╗ ████║
+██║     ██║   ██║██████╔╝██████╔╝██║   ██║    █████╗  ██████╔╝███████║██║        ██║   ██║   ██║██╔████╔██║
+██║     ██║   ██║██╔══██╗██╔═══╝ ██║   ██║    ██╔══╝  ██╔══██╗██╔══██║██║        ██║   ██║   ██║██║╚██╔╝██║
+╚██████╗╚██████╔╝██║  ██║██║     ╚██████╔╝    ██║     ██║  ██║██║  ██║╚██████╗   ██║   ╚██████╔╝██║ ╚═╝ ██║
+ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝      ╚═════╝     ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
 
-**Binary decompiler written in 100% Rust — ELF · PE · Mach-O → C / C++ / Rust**
+                             ░▒▓ CORPO FRACTUM ▓▒░
 
-> MVP status: loader + disassembler + CFG builder + C codegen + GTK4 UI skeleton.
+                  From gods came man. From binary, came code.
+
+        [ dissecting structure ]  [ lifting instructions ]  [ rebuilding meaning ]
+
+-----------------------------------------------------------------------------------------------------------
+
+## Overview
+
+Corpo Fractum is an open-source binary decompiler targeting x86-64 ELF binaries first, with PE and Mach-O support on the roadmap. It lifts machine code to a typed SSA intermediate representation and emits readable C pseudo-code, with C++ and Rust backends also available.
+
+The entire toolchain — loader, disassembler, IR, analysis, codegen and UI — is written in pure Rust.
 
 ---
 
-## Features (MVP)
+## Current focus
 
-| Feature | Status |
-|---------|--------|
-| ELF 32/64 parsing | ✅ |
+| Area | Status |
+|---|---|
+| ELF 64-bit parsing | ✅ |
+| x86-64 disassembly (Capstone, Intel syntax) | ✅ |
+| CFG construction (3-pass, branch-aware) | ✅ |
+| Function detection (symbols + call-site scan + jump tables) | ✅ |
+| x86-64 instruction lifter → SSA IR | ✅ |
+| Stack frame analysis (local variable naming) | ✅ |
+| ASCII / C-string recognition | ✅ |
+| C pseudo-code generation | ✅ |
+| Dominator tree + natural loop detection | ✅ |
+| GTK4 UI (explorer · code · graph panels) | 🚧 skeleton |
+
+## Also supported
+
+| Area | Status |
+|---|---|
+| ELF 32-bit parsing | ✅ |
 | PE / PE+ parsing | ✅ |
 | Mach-O / Fat binary parsing | ✅ |
-| x86-64 disassembly (Capstone) | ✅ |
 | ARM64 disassembly | ✅ |
-| CFG construction | ✅ |
-| Function detection (symbols + call scan) | ✅ |
-| C pseudo-code generation | ✅ |
 | C++ pseudo-code generation | ✅ |
 | Rust pseudo-code generation | ✅ |
-| GTK4 UI (explorer + code + graph panels) | ✅ skeleton |
+| Async analysis backend (Tokio) | ✅ |
 | Dark theme | ✅ |
-| Async backend (Tokio) | ✅ |
+
+---
+
+![image](MISC/logo.png)
 
 ---
 
@@ -43,23 +72,28 @@ sudo dnf install gtk4-devel cairo-devel
 
 ### Build
 
-```bashcargo build --release
+```bash
+cargo build --release
 ```
 
 ### Run
 
 ```bash
 ./target/release/corpo_fractum
-# or with debug logging:
+
+# With debug logging:
 RUSTDEC_LOG=debug ./target/release/corpo_fractum
+
+# Filter logs by crate:
+RUSTDEC_LOG=rustdec_analysis=debug,info ./target/release/corpo_fractum
 ```
 
 ### Tests
 
 ```bash
-cargo test                     # all unit + integration tests
-cargo test -p rustdec-loader   # loader only
-cargo test -p rustdec-disasm   # disassembler only
+cargo test                       # all tests
+cargo test -p rustdec-loader     # loader only
+cargo test -p rustdec-disasm     # disassembler only
 ```
 
 ---
@@ -68,15 +102,17 @@ cargo test -p rustdec-disasm   # disassembler only
 
 ```
 corpo_fractum/
-├── Cargo.toml                  # workspace root
+├── Cargo.toml                   # workspace root
 ├── crates/
-│   ├── rustdec-loader/         # ELF / PE / Mach-O parser  (goblin)
-│   ├── rustdec-disasm/         # multi-arch disassembler   (capstone-rs)
-│   ├── rustdec-ir/             # SSA intermediate representation
-│   ├── rustdec-analysis/       # CFG builder, function detection
-│   └── rustdec-codegen/        # C / C++ / Rust code generators
-├── rustdec-gui/                # GTK4 application (main binary)
-└── tests/                      # integration tests
+│   ├── rustdec-loader/          # ELF / PE / Mach-O parser      (goblin)
+│   ├── rustdec-disasm/          # multi-arch disassembler        (capstone-rs)
+│   ├── rustdec-ir/              # SSA intermediate representation
+│   ├── rustdec-analysis/        # CFG, function detection, dominance, structuration
+│   ├── rustdec-lift/            # x86-64 instruction lifter + frame analysis
+│   ├── rustdec-codegen/         # C / C++ / Rust code generators
+│   └── rustdec-plugin/          # Lua plugin engine              (mlua — stub)
+├── rustdec-gui/                 # GTK4 application               (main binary)
+└── tests/                       # integration tests
 ```
 
 ---
@@ -87,28 +123,31 @@ corpo_fractum/
 Binary file
     │
     ▼
-rustdec-loader      (goblin)
-    │  BinaryObject
+rustdec-loader          ELF / PE / Mach-O → BinaryObject + StringTable
+    │
     ▼
-rustdec-disasm      (capstone-rs)
-    │  Vec<Instruction>
+rustdec-disasm          Capstone → Vec<Instruction>
+    │
     ▼
-rustdec-analysis
-    │  IrModule (CFG per function)
+rustdec-analysis        CFG · function detection · dominance · structuration
+    │
     ▼
-rustdec-codegen
-    │  String (C / C++ / Rust)
+rustdec-lift            x86-64 → SSA IR · stack frame analysis · string annotation
+    │
     ▼
-rustdec-gui         (gtk4 + cairo + tokio)
+rustdec-codegen         IrModule → C / C++ / Rust pseudo-code
+    │
+    ▼
+rustdec-gui             GTK4 · Cairo · Tokio
 ```
 
 ---
 
 ## Roadmap
 
-- **MVP** (current): loader, disasm x86-64, CFG, C codegen, GTK skeleton
-- **V1**: ARM64/RISC-V, C++/Rust codegen, interactive call graph, multi-file
-- **V2**: plugin API, AI-assisted renaming, dynamic debugging (ptrace)
+- **MVP** (current) — ELF x86-64 · SSA IR · C codegen · stack frame naming · GTK4 skeleton
+- **V1** — ARM64 / RISC-V lifting · improved type inference · interactive call graph · multi-file projects
+- **V2** — Lua plugin API · AI-assisted renaming · dynamic analysis (ptrace)
 
 ---
 

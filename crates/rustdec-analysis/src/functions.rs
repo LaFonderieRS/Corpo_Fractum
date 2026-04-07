@@ -56,7 +56,7 @@ pub fn detect_functions(
         if insn.is_call() {
             if let Some(target) = insn.branch_target() {
                 if in_code(target) {
-                    let is_new = funcs
+                    let _is_new = funcs
                         .entry(target)
                         .or_insert_with(|| format!("sub_{:x}", target))
                         .is_empty(); // entry() always inserts or returns existing

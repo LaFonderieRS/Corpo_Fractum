@@ -125,6 +125,9 @@ impl RustBackend {
                 warn!(expr = %s, "Rust: opaque expression");
                 format!("/* {s} */ todo!()")
             }
+            Expr::StringRef { content, .. } => {
+                format!("b\"{}\\0\".as_ptr()", escape_rust_str(content))
+            }
         }
     }
 
@@ -140,6 +143,23 @@ impl RustBackend {
             Terminator::Unreachable => "unreachable!()".into(),
         }
     }
+}
+
+/// Escape a string for use inside a Rust byte-string literal `b"..."`.
+fn escape_rust_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"'  => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            c    => out.push(c),
+        }
+    }
+    out
 }
 
 fn binop_rust(op: &BinOp) -> &'static str {
