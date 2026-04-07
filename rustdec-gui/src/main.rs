@@ -6,6 +6,7 @@
 
 mod app;
 mod bridge;
+mod splash;
 mod ui;
 
 use gtk4::prelude::*;

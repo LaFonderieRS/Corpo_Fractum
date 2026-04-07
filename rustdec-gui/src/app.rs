@@ -1,5 +1,6 @@
 //! Application activation — builds the main window and wires up the UI.
 
+use glib;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, HeaderBar,
@@ -7,7 +8,8 @@ use gtk4::{
 };
 use tokio::runtime::Handle;
 
-use crate::bridge::AnalysisBridge;
+use crate::bridge::{AnalysisBridge, BridgeEvent};
+use crate::splash::SplashScreen;
 use crate::ui::{explorer::ExplorerPanel, graph::GraphPanel, code::CodePanel};
 
 /// Called once by GTK when the application is ready.
@@ -21,8 +23,40 @@ pub fn activate(app: &Application, rt: Handle) {
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
+    // ── Splash screen ─────────────────────────────────────────────────────────
+    let splash = SplashScreen::show();
+    splash.set_status("Initialising…");
+
     // ── Async bridge ──────────────────────────────────────────────────────────
     let bridge = AnalysisBridge::new(rt);
+
+    // ── Splash ↔ bridge wiring ─────────────────────────────────────────────────
+    {
+        let splash = splash.clone();
+        bridge.subscribe(move |event| match event {
+            BridgeEvent::AnalysisStarted(_) => {
+                splash.set_status("Loading binary…");
+                splash.set_progress(0.1);
+            }
+            BridgeEvent::AnalysisDone(_) | BridgeEvent::AnalysisError(_) => {
+                splash.dismiss();
+            }
+        });
+    }
+
+    // Dismiss the splash once the main window is presented.
+    // We use a short idle callback so the window has time to appear first.
+    {
+        let splash = splash.clone();
+        glib::idle_add_local_once(move || {
+            // Small delay so the user sees the splash before it disappears
+            // when no file is loaded at startup.
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(1_800),
+                move || splash.dismiss(),
+            );
+        });
+    }
 
     // ── Panels ────────────────────────────────────────────────────────────────
     let explorer = ExplorerPanel::new(bridge.clone());

@@ -72,3 +72,54 @@ entry, searchentry {
     padding: 4px 8px;
     margin: 4px;
 }
+
+/* ── Splash screen ────────────────────────────────────────────────────────── */
+
+#splash-window {
+    background-color: #1e1e2e;
+    border: 1px solid #45475a;
+    border-radius: 10px;
+}
+
+#splash-name {
+    font-size: 28px;
+    font-weight: bold;
+    color: #cba6f7;
+    letter-spacing: 2px;
+}
+
+#splash-version {
+    font-size: 11px;
+    color: #6c7086;
+    margin-top: -4px;
+}
+
+#splash-tagline {
+    font-size: 11px;
+    color: #585b70;
+    margin-top: 8px;
+}
+
+#splash-status {
+    font-size: 11px;
+    color: #6c7086;
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+}
+
+#splash-progress {
+    min-height: 4px;
+    border-radius: 2px;
+    margin-top: 4px;
+}
+
+#splash-progress trough {
+    background-color: #313244;
+    border-radius: 2px;
+    min-height: 4px;
+}
+
+#splash-progress progress {
+    background-color: #cba6f7;
+    border-radius: 2px;
+    min-height: 4px;
+}
