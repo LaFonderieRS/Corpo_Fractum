@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 rustdec-disasm.workspace  = true
 rustdec-ir.workspace      = true
+rustdec-loader.workspace  = true
 petgraph.workspace        = true
 thiserror.workspace       = true
 tracing.workspace         = true

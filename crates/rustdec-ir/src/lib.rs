@@ -13,6 +13,7 @@
 //! - Confidence scores so the UI can highlight uncertain deductions.
 
 use petgraph::graph::DiGraph;
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -103,6 +104,9 @@ pub enum Expr {
     Cast { val: Value, to: IrType },
     /// Unresolved / opaque expression.
     Opaque(String),
+    /// Reference to a known string literal in the binary image.
+    /// `addr` is the virtual address; `content` is the decoded text.
+    StringRef { addr: u64, content: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +154,38 @@ pub enum Terminator {
     Return(Option<Value>),
     /// Unreachable (e.g. after `ud2`, `hlt`).
     Unreachable,
+}
+
+// ── Stack frame ──────────────────────────────────────────────────────────────
+
+/// Origin of a stack slot — used by codegen to choose the right name prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlotOrigin {
+    /// Local variable allocated in the callee frame (`[rbp - N]`).
+    Local,
+    /// Argument passed on the stack by the caller (`[rbp + N]`).
+    StackArg,
+    /// Callee-saved register spilled to the stack.
+    SavedReg,
+    /// Slot whose role could not be determined.
+    Unknown,
+}
+
+/// A named, typed slot in the function's stack frame.
+///
+/// The lifter creates one `StackSlot` for every distinct `[rbp ± offset]`
+/// or `[rsp ± offset]` pattern it encounters.  The codegen then replaces
+/// opaque pointer-arithmetic expressions with the human-readable name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackSlot {
+    /// Byte offset from `rbp` (negative = local, positive = stack argument).
+    pub rbp_offset: i64,
+    /// Inferred element type (may be `Unknown`).
+    pub ty:         IrType,
+    /// Human-readable name emitted by codegen (`local_0`, `arg_0`, …).
+    pub name:       String,
+    /// How we think this slot is used.
+    pub origin:     SlotOrigin,
 }
 
 // ── Basic Block ───────────────────────────────────────────────────────────────
@@ -207,18 +243,37 @@ pub struct IrFunction {
     pub ret_ty:      IrType,
     /// Next SSA variable index (monotonically increasing).
     pub next_var_id: u32,
+    /// Stack frame slots discovered during lifting.
+    /// Key = rbp_offset (signed byte offset from rbp).
+    pub slot_table:  HashMap<i64, StackSlot>,
+    /// Total frame size in bytes (deduced from `sub rsp, N` in prologue).
+    /// Zero if the prologue was not recognised.
+    pub frame_size:  u64,
 }
 
 impl IrFunction {
     pub fn new(name: impl Into<String>, entry_addr: u64) -> Self {
         Self {
-            name: name.into(),
+            name:        name.into(),
             entry_addr,
-            cfg: CfgGraph::new(),
-            params: vec![],
-            ret_ty: IrType::Unknown,
+            cfg:         CfgGraph::new(),
+            params:      vec![],
+            ret_ty:      IrType::Unknown,
             next_var_id: 0,
+            slot_table:  HashMap::new(),
+            frame_size:  0,
         }
+    }
+
+    /// Look up the stack slot for a given rbp offset, or create a new one.
+    ///
+    /// `ty` is used only when creating a new slot — existing slots keep their
+    /// previously inferred type.
+    pub fn get_or_insert_slot(&mut self, rbp_offset: i64, ty: IrType) -> &StackSlot {
+        self.slot_table.entry(rbp_offset).or_insert_with(|| {
+            let (name, origin) = classify_slot(rbp_offset);
+            StackSlot { rbp_offset, ty, name, origin }
+        })
     }
 
     /// Allocate a fresh SSA variable id.
@@ -247,5 +302,35 @@ impl IrFunction {
 /// Top-level IR module — one per analysed binary.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IrModule {
-    pub functions: Vec<IrFunction>,
+    pub functions:    Vec<IrFunction>,
+    /// String literals extracted from the binary's read-only sections.
+    /// Key = virtual address, value = decoded content.
+    /// Populated by the analysis pipeline; empty for modules built manually.
+    #[serde(default)]
+    pub string_table: HashMap<u64, String>,
+}
+
+// ── Stack slot helpers ────────────────────────────────────────────────────────
+
+/// Derive a human-readable name and origin for a stack slot at `rbp_offset`.
+///
+/// Convention:
+/// - `rbp - 8`, `rbp - 16`, … → `local_0`, `local_1`, … (zero-indexed by slot)
+/// - `rbp + 16`, `rbp + 24`, … → `arg_0`, `arg_1`, … (first stack arg at +16
+///    on x86-64 System V: +8 = saved return address, +0 = saved rbp)
+/// - `rbp + 0` / `rbp - 0`    → `saved_rbp`
+fn classify_slot(rbp_offset: i64) -> (String, SlotOrigin) {
+    match rbp_offset {
+        0 => ("saved_rbp".into(), SlotOrigin::SavedReg),
+        o if o < 0 => {
+            // Local variables — index by slot size (assume 8-byte slots).
+            let idx = ((-o - 1) / 8) as usize;
+            (format!("local_{idx}"), SlotOrigin::Local)
+        }
+        o => {
+            // Stack arguments — first one at rbp+16 (rbp+8 = return address).
+            let idx = ((o - 16).max(0) / 8) as usize;
+            (format!("arg_{idx}"), SlotOrigin::StackArg)
+        }
+    }
 }

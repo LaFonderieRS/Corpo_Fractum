@@ -1,12 +1,6 @@
 //! # rustdec-codegen
 //!
-//! Code generation backends.  Each backend implements [`CodegenBackend`] and
-//! receives an [`IrFunction`] to turn into a pretty-printed source string.
-//!
-//! Current backends:
-//! - [`c::CBackend`]   — C99 pseudo-code (MVP, priority)
-//! - [`cpp::CppBackend`] — C++17 pseudo-code
-//! - [`rust::RustBackend`] — Rust pseudo-code
+//! Code generation backends: C, C++, Rust.
 
 pub mod c;
 pub mod cpp;
@@ -14,8 +8,7 @@ pub mod rust;
 
 use rustdec_ir::{IrFunction, IrModule};
 use thiserror::Error;
-
-// ── Error ─────────────────────────────────────────────────────────────────────
+use tracing::{debug, info, instrument, warn};
 
 #[derive(Debug, Error)]
 pub enum CodegenError {
@@ -27,8 +20,6 @@ pub enum CodegenError {
 
 pub type CodegenResult<T> = Result<T, CodegenError>;
 
-// ── Target language selector ──────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     C,
@@ -36,37 +27,41 @@ pub enum Language {
     Rust,
 }
 
-// ── Trait ─────────────────────────────────────────────────────────────────────
-
-/// A code generation backend: transforms one IR function into source text.
 pub trait CodegenBackend {
-    /// Emit source code for a single function.
     fn emit_function(&self, func: &IrFunction) -> CodegenResult<String>;
-
-    /// Emit a type name for display (e.g. in struct/variable declarations).
     fn emit_type(&self, ty: &rustdec_ir::IrType) -> String;
 }
 
-// ── Module-level helper ───────────────────────────────────────────────────────
-
-/// Emit pseudo-code for every function in `module` using the requested language.
-///
-/// Returns a `Vec<(function_name, source_code)>`.
+/// Emit pseudo-code for every function in `module`.
+/// Returns `Vec<(function_name, source_code)>`.
+#[instrument(skip(module), fields(lang = ?lang, functions = module.functions.len()))]
 pub fn emit_module(
     module: &IrModule,
-    lang: Language,
+    lang:   Language,
 ) -> CodegenResult<Vec<(String, String)>> {
-    let results = module
-        .functions
-        .iter()
-        .map(|func| {
-            let src = match lang {
-                Language::C    => c::CBackend.emit_function(func)?,
-                Language::Cpp  => cpp::CppBackend.emit_function(func)?,
-                Language::Rust => rust::RustBackend.emit_function(func)?,
-            };
-            Ok((func.name.clone(), src))
-        })
-        .collect::<CodegenResult<Vec<_>>>()?;
+    info!("emitting {:?} code for {} functions", lang, module.functions.len());
+
+    let mut results = Vec::with_capacity(module.functions.len());
+
+    for func in &module.functions {
+        debug!(func = %func.name, blocks = func.cfg.node_count(), "emitting function");
+
+        let src = match lang {
+            Language::C    => c::CBackend { string_table: module.string_table.clone() }.emit_function(func)?,
+            Language::Cpp  => cpp::CppBackend.emit_function(func)?,
+            Language::Rust => rust::RustBackend.emit_function(func)?,
+        };
+
+        let lines = src.lines().count();
+        debug!(func = %func.name, lines, "function emitted");
+
+        if src.contains("no blocks decoded") {
+            warn!(func = %func.name, "function has no decoded blocks — output may be empty");
+        }
+
+        results.push((func.name.clone(), src));
+    }
+
+    info!(lang = ?lang, emitted = results.len(), "codegen complete");
     Ok(results)
 }

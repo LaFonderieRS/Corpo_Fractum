@@ -27,12 +27,19 @@
 use std::collections::{HashMap, HashSet};
 
 use rustdec_analysis::{structure_function, CondExpr, SNode};
+use rustdec_lift::frame::{is_slot_id, slot_id_to_offset};
 use rustdec_ir::{BinOp, BasicBlock, CallTarget, Expr, IrFunction, IrType, Stmt, Terminator, Value};
 use tracing::{debug, trace, warn};
 
 use crate::{CodegenBackend, CodegenResult};
 
-pub struct CBackend;
+/// C99 code generation backend.
+///
+/// `string_table` is optional — when provided, `Expr::StringRef` nodes
+/// are emitted as C string literals instead of hex addresses.
+pub struct CBackend {
+    pub string_table: HashMap<u64, String>,
+}
 
 // ── Trait implementation ──────────────────────────────────────────────────────
 
@@ -105,7 +112,7 @@ impl CodegenBackend for CBackend {
 
         // ── Emit structured body ──────────────────────────────────────────────
         let structured = structure_function(func);
-        self.emit_node(&structured.root, &structured, &copy_table, &written_vars, &mut out, 1);
+        self.emit_node(&structured.root, &structured, &copy_table, &written_vars, &func.slot_table, &mut out, 1);
 
         out.push_str("}\n");
         debug!(func = %func.name, lines = out.lines().count(),
@@ -171,6 +178,27 @@ fn resolve<'a>(v: &'a Value, copies: &'a HashMap<u32, Value>) -> &'a Value {
     v
 }
 
+/// Display a `Value`, substituting named slot variables where possible.
+///
+/// If the value's SSA id corresponds to a stack slot, we return the
+/// slot name (`local_0`, `arg_1`, …) instead of `vN`.
+fn display_value(
+    v:          &Value,
+    copies:     &HashMap<u32, Value>,
+    slot_table: &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
+) -> String {
+    let resolved = resolve(v, copies);
+    if let Value::Var { id, .. } = resolved {
+        if is_slot_id(*id) {
+            let offset = slot_id_to_offset(*id);
+            if let Some(slot) = slot_table.get(&offset) {
+                return format!("&{}", slot.name);
+            }
+        }
+    }
+    resolved.display()
+}
+
 // ── Structured tree emitter ───────────────────────────────────────────────────
 
 impl CBackend {
@@ -184,6 +212,7 @@ impl CBackend {
         sfunc:   &rustdec_analysis::StructuredFunc,
         copies:  &HashMap<u32, Value>,
         written: &HashSet<u32>,
+        slots:   &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
         out:     &mut String,
         depth:   usize,
     ) {
@@ -195,7 +224,7 @@ impl CBackend {
                            stmts = bb.stmts.len(),
                            "C: emit block");
                     for stmt in &bb.stmts {
-                        if let Some(line) = self.emit_stmt_opt(stmt, copies, written) {
+                        if let Some(line) = self.emit_stmt_opt(stmt, copies, written, slots) {
                             out.push_str(&format!("{ind}{line};\n"));
                         }
                     }
@@ -216,16 +245,16 @@ impl CBackend {
 
             SNode::Seq(nodes) => {
                 for n in nodes {
-                    self.emit_node(n, sfunc, copies, written, out, depth);
+                    self.emit_node(n, sfunc, copies, written, slots, out, depth);
                 }
             }
 
             SNode::IfElse { cond, then, else_ } => {
-                let cond_str = self.emit_cond(cond, sfunc, copies, written);
+                let cond_str = self.emit_cond(cond, sfunc, copies, written, slots);
                 out.push_str(&format!("{ind}if ({cond_str}) {{\n"));
-                self.emit_node(then, sfunc, copies, written, out, depth + 1);
+                self.emit_node(then, sfunc, copies, written, slots, out, depth + 1);
                 let mut else_buf = String::new();
-                self.emit_node(else_, sfunc, copies, written, &mut else_buf, depth + 1);
+                self.emit_node(else_, sfunc, copies, written, slots, &mut else_buf, depth + 1);
                 if !else_buf.trim().is_empty() {
                     out.push_str(&format!("{ind}}} else {{\n"));
                     out.push_str(&else_buf);
@@ -234,9 +263,9 @@ impl CBackend {
             }
 
             SNode::Loop { cond, body } => {
-                let cond_str = self.emit_cond(cond, sfunc, copies, written);
+                let cond_str = self.emit_cond(cond, sfunc, copies, written, slots);
                 out.push_str(&format!("{ind}while ({cond_str}) {{\n"));
-                self.emit_node(body, sfunc, copies, written, out, depth + 1);
+                self.emit_node(body, sfunc, copies, written, slots, out, depth + 1);
                 out.push_str(&format!("{ind}}}\n"));
             }
 
@@ -255,6 +284,7 @@ impl CBackend {
         stmt:   &Stmt,
         copies: &HashMap<u32, Value>,
         written: &HashSet<u32>,
+        slots:   &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
     ) -> Option<String> {
         match stmt {
             Stmt::Nop => None,
@@ -264,14 +294,28 @@ impl CBackend {
                 if copies.contains_key(lhs) {
                     return None;
                 }
-                let rhs_str = self.emit_expr_resolved(rhs, copies, written);
+                let rhs_str = self.emit_expr_resolved(rhs, copies, written, slots);
                 // Emit as assignment (no type — variables are declared at top).
+                // Slot vars are never assigned to directly (they are addressed
+                // via their pointer), so we suppress them here.
+                if is_slot_id(*lhs) {
+                    return None;
+                }
                 Some(format!("v{lhs} = {rhs_str}"))
             }
 
             Stmt::Store { ptr, val } => {
                 let ptr_r = resolve(ptr, copies);
                 let val_r = resolve(val, copies);
+                // Slot store → named assignment.
+                if let Value::Var { id, .. } = ptr_r {
+                    if is_slot_id(*id) {
+                        let offset = slot_id_to_offset(*id);
+                        if let Some(slot) = slots.get(&offset) {
+                            return Some(format!("{} = {}", slot.name, val_r.display()));
+                        }
+                    }
+                }
                 Some(format!("*({}) = {}", ptr_r.display(), val_r.display()))
             }
         }
@@ -284,6 +328,7 @@ impl CBackend {
         sfunc:   &rustdec_analysis::StructuredFunc,
         copies:  &HashMap<u32, Value>,
         _written: &HashSet<u32>,
+        slots:   &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
     ) -> String {
         let bb = sfunc.blocks.values()
             .find(|b| b.start_addr == cond.block_addr);
@@ -319,6 +364,7 @@ impl CBackend {
         expr:    &Expr,
         copies:  &HashMap<u32, Value>,
         written: &HashSet<u32>,
+        slots:   &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
     ) -> String {
         match expr {
             Expr::Value(v) => resolve(v, copies).display(),
@@ -330,8 +376,17 @@ impl CBackend {
             }
 
             Expr::Load { ptr, ty } => {
-                let p = resolve(ptr, copies);
-                format!("*({}*){}", self.emit_type(ty), p.display())
+                let p = display_value(ptr, copies, slots);
+                // If the ptr is a slot reference, emit as named variable access.
+                if let Value::Var { id, .. } = resolve(ptr, copies) {
+                    if is_slot_id(*id) {
+                        let offset = slot_id_to_offset(*id);
+                        if let Some(slot) = slots.get(&offset) {
+                            return slot.name.clone();
+                        }
+                    }
+                }
+                format!("*({}*){}", self.emit_type(ty), p)
             }
 
             Expr::Call { target, args, .. } => {
@@ -389,6 +444,13 @@ impl CBackend {
                 // (the surrounding emit_stmt_opt wraps this in a statement).
                 format!("/* {s} */")
             }
+
+            Expr::StringRef { addr, content } => {
+                // Emit as a C string literal with proper escaping.
+                // If the string_table has a higher-fidelity version, use it.
+                let text = self.string_table.get(addr).unwrap_or(content);
+                format!(""{}"", escape_c_string(text))
+            }
         }
     }
 }
@@ -430,6 +492,24 @@ fn binop_c(op: &BinOp) -> &'static str {
         BinOp::Ult | BinOp::Slt => "<",
         BinOp::Ule | BinOp::Sle => "<=",
     }
+}
+
+/// Escape a string for use as a C string literal.
+fn escape_c_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str("\\\""),
+            '\\'  => out.push_str("\\\\"),
+            '\n'  => out.push_str("\\n"),
+            '\r'  => out.push_str("\\r"),
+            '\t'  => out.push_str("\\t"),
+            '\0'  => out.push_str("\\0"),
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            c    => { let _ = c; out.push_str("?"); }
+        }
+    }
+    out
 }
 
 fn sanitise_name(name: &str) -> String {

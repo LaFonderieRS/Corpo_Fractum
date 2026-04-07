@@ -14,7 +14,7 @@ pub use functions::detect_functions;
 pub use structure::{structure_function, StructuredFunc, SNode, CondExpr};
 
 use rustdec_ir::IrModule;
-use rustdec_loader::BinaryObject;
+use rustdec_loader::{BinaryObject, StringTable, extract_strings};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
@@ -73,6 +73,10 @@ pub fn analyse(obj: &BinaryObject) -> AnalysisResult<IrModule> {
     info!(total_instructions = all_insns.len(), "disassembly complete");
 
     // ── 2. Detect functions ───────────────────────────────────────────────────
+    // Extract string literals from read-only sections.
+    let string_table = extract_strings(obj);
+    info!(strings = string_table.len(), "string table built");
+
     let entry_points = detect_functions(obj, &all_insns);
     info!(functions = entry_points.len(), "function detection complete");
 
@@ -85,6 +89,7 @@ pub fn analyse(obj: &BinaryObject) -> AnalysisResult<IrModule> {
            "computing function boundaries");
 
     let mut module = IrModule::default();
+    module.string_table = string_table.clone();
 
     for (i, &(entry_addr, name)) in sorted_entries.iter().enumerate() {
         let end_addr = sorted_entries.get(i + 1)
@@ -110,7 +115,7 @@ pub fn analyse(obj: &BinaryObject) -> AnalysisResult<IrModule> {
                "CFG complete — lifting");
 
         // Lift: fill in IR stmts and infer types.
-        lift_function(&mut func, &all_insns);
+        lift_function(&mut func, &all_insns, &string_table);
 
         let total_stmts: usize = func.blocks_sorted()
             .iter()
