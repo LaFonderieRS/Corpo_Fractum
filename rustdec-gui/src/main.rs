@@ -6,19 +6,28 @@
 
 mod app;
 mod bridge;
+mod log_layer;
 mod splash;
 mod ui;
 
 use gtk4::prelude::*;
 use gtk4::Application;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 const APP_ID: &str = "io.rustdec.RustDec";
 
 fn main() -> anyhow::Result<()> {
     // Logging — RUSTDEC_LOG=debug rustdec
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_env("RUSTDEC_LOG"))
+    //
+    // Two layers:
+    //   1. fmt  — human-readable output on stdout (existing behaviour)
+    //   2. gtk  — forwards every record to the in-app Console panel
+    let (gtk_layer, log_rx) = log_layer::GtkLogLayer::new();
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::from_env("RUSTDEC_LOG")))
+        .with(gtk_layer)
         .init();
 
     // Tokio runtime for async analysis tasks.
@@ -33,9 +42,9 @@ fn main() -> anyhow::Result<()> {
         .build();
 
     app.connect_activate(move |gtk_app| {
-        // Pass the runtime handle into the UI so it can spawn analysis tasks.
+        // Pass the runtime handle and log receiver into the UI.
         let handle = rt.handle().clone();
-        app::activate(gtk_app, handle);
+        app::activate(gtk_app, handle, log_rx.clone());
     });
 
     let exit_code = app.run();

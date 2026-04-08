@@ -1,19 +1,22 @@
-//! Console panel — displays analysis lifecycle events.
+//! Console panel — displays analysis lifecycle events and tracing log records.
 
+use glib::MainContext;
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Label, Orientation, PolicyType,
     ScrolledWindow, TextBuffer, TextView, Widget, WrapMode,
 };
+use tracing::Level;
 
 use crate::bridge::{AnalysisBridge, BridgeEvent};
+use crate::log_layer::LogRecord;
 
 pub struct ConsolePanel {
     root: GtkBox,
 }
 
 impl ConsolePanel {
-    pub fn new(bridge: AnalysisBridge) -> Self {
+    pub fn new(bridge: AnalysisBridge, log_rx: async_channel::Receiver<LogRecord>) -> Self {
         let root = GtkBox::new(Orientation::Vertical, 0);
 
         let header = Label::new(Some("Console"));
@@ -24,6 +27,9 @@ impl ConsolePanel {
 
         if let Some(tag) = buffer.create_tag(Some("info"), &[]) {
             tag.set_foreground(Some("#8a8a8a"));
+        }
+        if let Some(tag) = buffer.create_tag(Some("debug"), &[]) {
+            tag.set_foreground(Some("#5a7a8a"));
         }
         if let Some(tag) = buffer.create_tag(Some("warn"), &[]) {
             tag.set_foreground(Some("#d7ba7d"));
@@ -50,6 +56,7 @@ impl ConsolePanel {
             .build();
         root.append(&scroll);
 
+        // ── Bridge events (analysis lifecycle) ────────────────────────────────
         {
             let buf = buffer.clone();
             let view = view.clone();
@@ -69,6 +76,28 @@ impl ConsolePanel {
                     ),
                 };
                 append_line(&buf, &view, severity, &msg);
+            });
+        }
+
+        // ── Tracing log records ───────────────────────────────────────────────
+        {
+            let buf = buffer.clone();
+            let view = view.clone();
+            MainContext::default().spawn_local(async move {
+                while let Ok(record) = log_rx.recv().await {
+                    let (severity, prefix) = match record.level {
+                        Level::ERROR => ("error", "ERROR"),
+                        Level::WARN  => ("warn",  "WARN "),
+                        Level::INFO  => ("info",  "INFO "),
+                        Level::DEBUG => ("debug", "DEBUG"),
+                        Level::TRACE => ("debug", "TRACE"),
+                    };
+                    let msg = format!(
+                        "[{prefix}] {}: {}",
+                        record.target, record.message
+                    );
+                    append_line(&buf, &view, severity, &msg);
+                }
             });
         }
 

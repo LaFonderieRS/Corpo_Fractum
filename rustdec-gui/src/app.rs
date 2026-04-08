@@ -19,11 +19,12 @@ use crate::ui::console::ConsolePanel;
 use tokio::runtime::Handle;
 
 use crate::bridge::{AnalysisBridge, BridgeEvent};
+use crate::log_layer::LogRecord;
 use crate::splash::SplashScreen;
 use crate::ui::{explorer::ExplorerPanel, graph::GraphPanel, code::CodePanel};
 
 /// Called once by GTK when the application is ready.
-pub fn activate(app: &Application, rt: Handle) {
+pub fn activate(app: &Application, rt: Handle, log_rx: async_channel::Receiver<LogRecord>) {
     // ── CSS — dark theme overrides ────────────────────────────────────────────
     let css = gtk4::CssProvider::new();
     css.load_from_string(include_str!("style.css"));
@@ -80,7 +81,7 @@ pub fn activate(app: &Application, rt: Handle) {
     // Option B: graph slot becomes a GtkNotebook with Graph + Console tabs.
     #[cfg(feature = "console-tab")]
     {
-        let console = ConsolePanel::new(bridge.clone());
+        let console = ConsolePanel::new(bridge.clone(), log_rx.clone());
         let notebook = Notebook::new();
         notebook.append_page(graph_view.widget(), Some(&Label::new(Some("Graph"))));
         notebook.append_page(console.widget(), Some(&Label::new(Some("Console"))));
@@ -97,7 +98,7 @@ pub fn activate(app: &Application, rt: Handle) {
     // Option A: console goes below the code+graph pane in an outer vertical split.
     #[cfg(feature = "console-bottom")]
     {
-        let console = ConsolePanel::new(bridge.clone());
+        let console = ConsolePanel::new(bridge.clone(), log_rx);
         let outer_right = Paned::new(Orientation::Vertical);
         outer_right.set_start_child(Some(&right_pane));
         outer_right.set_end_child(Some(console.widget()));
