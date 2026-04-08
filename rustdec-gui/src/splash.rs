@@ -41,10 +41,11 @@ pub struct SplashScreen {
 }
 
 struct Inner {
-    window:   Window,
-    status:   Label,
-    progress: ProgressBar,
-    dismissed: bool,
+    window:       Window,
+    status:       Label,
+    progress:     ProgressBar,
+    dismissed:    bool,
+    on_dismissed: Vec<Box<dyn Fn() + 'static>>,
 }
 
 impl SplashScreen {
@@ -109,24 +110,19 @@ impl SplashScreen {
                 window,
                 status,
                 progress,
-                dismissed: false,
+                dismissed:    false,
+                on_dismissed: Vec::new(),
             })),
         };
 
-        // Auto-dismiss after timeout.
+        // Auto-dismiss after timeout — route through dismiss() so callbacks fire.
         {
-            let splash_weak = Rc::downgrade(&splash.inner);
+            let splash = splash.clone();
             glib::timeout_add_local_once(
                 std::time::Duration::from_millis(SPLASH_TIMEOUT_MS as u64),
                 move || {
-                    if let Some(inner) = splash_weak.upgrade() {
-                        let mut inner = inner.borrow_mut();
-                        if !inner.dismissed {
-                            debug!("splash: auto-dismissed after timeout");
-                            inner.window.close();
-                            inner.dismissed = true;
-                        }
-                    }
+                    debug!("splash: auto-dismissed after timeout");
+                    splash.dismiss();
                 },
             );
         }
@@ -149,13 +145,28 @@ impl SplashScreen {
         self.inner.borrow().progress.pulse();
     }
 
+    /// Register a callback that fires once when the splash is dismissed.
+    /// Guaranteed to be called regardless of which dismiss path fires.
+    pub fn connect_dismissed(&self, cb: impl Fn() + 'static) {
+        self.inner.borrow_mut().on_dismissed.push(Box::new(cb));
+    }
+
     /// Hide and destroy the splash window.
     pub fn dismiss(&self) {
-        let mut inner = self.inner.borrow_mut();
-        if !inner.dismissed {
+        // Close and mark dismissed under a short borrow, then release before
+        // calling callbacks so they can freely use other shared state.
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.dismissed {
+                return;
+            }
             inner.window.close();
             inner.dismissed = true;
             debug!("splash screen dismissed");
+        }
+
+        for cb in &self.inner.borrow().on_dismissed {
+            cb();
         }
     }
 }
@@ -179,7 +190,7 @@ fn build_window() -> Window {
     // GTK4 doesn't expose set_position(), so we use a size-allocate signal
     // to reposition on first draw.
     {
-        let win_ref = win.clone();
+        let _win_ref = win.clone();
         win.connect_realize(move |_| {
             if let Some(display) = gtk4::gdk::Display::default() {
                 if let Some(monitor) = display.monitors().item(0) {

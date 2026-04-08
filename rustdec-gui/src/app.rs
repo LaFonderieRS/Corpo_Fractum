@@ -55,20 +55,6 @@ pub fn activate(app: &Application, rt: Handle, log_rx: async_channel::Receiver<L
         });
     }
 
-    // Dismiss the splash once the main window is presented.
-    // We use a short idle callback so the window has time to appear first.
-    {
-        let splash = splash.clone();
-        glib::idle_add_local_once(move || {
-            // Small delay so the user sees the splash before it disappears
-            // when no file is loaded at startup.
-            glib::timeout_add_local_once(
-                std::time::Duration::from_millis(1_800),
-                move || splash.dismiss(),
-            );
-        });
-    }
-
     // ── Panels ────────────────────────────────────────────────────────────────
     let explorer = ExplorerPanel::new(bridge.clone());
     let code_view = CodePanel::new(bridge.clone());
@@ -145,7 +131,20 @@ pub fn activate(app: &Application, rt: Handle, log_rx: async_channel::Receiver<L
         .child(&main_pane)
         .build();
     window.set_titlebar(Some(&header));
-    window.present();
+
+    // Present the main window only after the splash closes.
+    {
+        let window = window.clone();
+        splash.connect_dismissed(move || window.present());
+    }
+
+    // Dismiss the splash after a short delay so the user sees it at startup.
+    glib::idle_add_local_once(move || {
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(1_800),
+            move || splash.dismiss(),
+        );
+    });
 }
 
 // ── File open dialog ──────────────────────────────────────────────────────────
