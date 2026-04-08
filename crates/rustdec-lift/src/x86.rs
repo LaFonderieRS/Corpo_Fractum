@@ -95,6 +95,7 @@ fn is_known_mnemonic_root(s: &str) -> bool {
         | "sub"  | "add"  | "and"  | "or"   | "xor"
         | "cmp"  | "test" | "adc"  | "sbb"
         | "shl"  | "shr"  | "sar"  | "imul" | "mul"
+        | "idiv" | "div"
         | "inc"  | "dec"  | "neg"  | "not"
         | "lea"  | "call" | "ret"  | "jmp"
         | "nop"  | "leave"| "xchg"
@@ -124,8 +125,8 @@ fn lift_insn(
 
     match mnem {
         // ── Data movement ────────────────────────────────────────────────────
-        "mov" | "movabs" | "movzx" | "movsx" | "movsxd"
-        | "movz" | "movs" => lift_mov(dst, src, next_id, regs),
+        "movsx" | "movsxd" => lift_movsx(dst, src, next_id, regs),
+        "mov" | "movabs" | "movzx" | "movz" | "movs" => lift_mov(dst, src, next_id, regs),
 
         "lea"   => lift_lea(dst, src, next_id, regs),
         "push"  => lift_push(dst, next_id, regs),
@@ -152,6 +153,9 @@ fn lift_insn(
         | "adc" | "sbb"
         | "shl" | "shr" | "sar"
         | "imul" | "mul" => lift_binop(mnem, dst, src, next_id, regs, flags),
+
+        "div"  => lift_div(dst, next_id, regs, false),
+        "idiv" => lift_div(dst, next_id, regs, true),
 
         "inc" => lift_incdec(dst, BinOp::Add, next_id, regs),
         "dec" => lift_incdec(dst, BinOp::Sub, next_id, regs),
@@ -455,17 +459,21 @@ fn lift_binop(
     let rhs_val = operand_to_val(src, regs);
     let ty = value_type(&lhs_val);
 
-    let op = match mnem {
-        "add" | "adc"          => BinOp::Add,
-        "sub" | "sbb" | "cmp"  => BinOp::Sub,
-        "and" | "test"         => BinOp::And,
-        "or"                   => BinOp::Or,
-        "xor"                  => BinOp::Xor,
-        "shl"                  => BinOp::Shl,
-        "shr"                  => BinOp::LShr,
-        "sar"                  => BinOp::AShr,
-        "imul" | "mul"         => BinOp::Mul,
-        _                      => BinOp::Add,
+    // Determine the BinOp and whether the result type should be signed.
+    // `imul` and `sar` produce signed results — stamp SInt so downstream
+    // comparisons and codegen can distinguish signed from unsigned arithmetic.
+    let (op, result_ty) = match mnem {
+        "add" | "adc"          => (BinOp::Add,  ty.clone()),
+        "sub" | "sbb" | "cmp"  => (BinOp::Sub,  ty.clone()),
+        "and" | "test"         => (BinOp::And,  ty.clone()),
+        "or"                   => (BinOp::Or,   ty.clone()),
+        "xor"                  => (BinOp::Xor,  ty.clone()),
+        "shl"                  => (BinOp::Shl,  ty.clone()),
+        "shr"                  => (BinOp::LShr, ty.clone()),
+        "sar"                  => (BinOp::AShr, to_signed(&ty)), // signed result
+        "imul"                 => (BinOp::Mul,  to_signed(&ty)), // signed result
+        "mul"                  => (BinOp::Mul,  ty.clone()),
+        _                      => (BinOp::Add,  ty.clone()),
     };
 
     // xor reg, reg idiom → 0  (very common zeroing pattern)
@@ -481,24 +489,83 @@ fn lift_binop(
     }
 
     // Core computation.
-    let (res_id, res_val) = fresh(next_id, ty.clone());
-    stmts.push(Stmt::Assign { lhs: res_id, ty: ty.clone(),
+    let (res_id, _) = fresh(next_id, result_ty.clone());
+    stmts.push(Stmt::Assign { lhs: res_id, ty: result_ty.clone(),
         rhs: Expr::BinOp { op, lhs: lhs_val, rhs: rhs_val } });
 
     // Write-back (cmp / test are flag-only — no destination update).
     if mnem != "cmp" && mnem != "test" {
-        // Direct reuse of res_id avoids an extra copy stmt.
         regs.set(dst, res_id);
     }
 
-    // Zero flag: ZF = (result == 0).
-    let (zf_id, _) = fresh(next_id, IrType::UInt(1));
+    // Zero flag: ZF = (result == 0).  Use UInt(8) so codegen emits uint8_t.
+    let res_ref = Value::Var { id: res_id, ty: result_ty.clone() };
+    let (zf_id, _) = fresh(next_id, IrType::UInt(8));
     flags.zf = Some(zf_id);
-    stmts.push(Stmt::Assign { lhs: zf_id, ty: IrType::UInt(1),
-        rhs: Expr::BinOp { op: BinOp::Eq, lhs: res_val,
-            rhs: Value::Const { val: 0, ty } } });
+    stmts.push(Stmt::Assign { lhs: zf_id, ty: IrType::UInt(8),
+        rhs: Expr::BinOp { op: BinOp::Eq, lhs: res_ref,
+            rhs: Value::Const { val: 0, ty: result_ty } } });
 
     stmts
+}
+
+/// `movsx`/`movsxd` — sign-extend src into dst, stamp SInt on the result.
+///
+/// Unlike plain `mov`, these indicate the value is signed by intent.
+/// Propagating `SInt` here means that any subsequent `cmp`/`jl` using
+/// this register will find a signed type and emit the correct cast.
+fn lift_movsx(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
+    let src_val = operand_to_val(src, regs);
+    let dst_bits = match reg_type(dst) {
+        IrType::UInt(b) | IrType::SInt(b) => b,
+        _ => 64,
+    };
+    let dst_ty = IrType::SInt(dst_bits);
+    let (new_id, _) = fresh(next_id, dst_ty.clone());
+    regs.set(dst, new_id);
+    let mut stmts = vec![Stmt::Assign {
+        lhs: new_id, ty: dst_ty.clone(),
+        rhs: Expr::Cast { val: src_val, to: dst_ty.clone() },
+    }];
+    // x86-64: writing a 32-bit reg zero-extends into the 64-bit counterpart.
+    // For sign-extension, keep the signed type all the way to 64 bits so that
+    // the 64-bit register also carries SInt — this prevents spurious unsigned
+    // casts in codegen when the full-width register is later compared.
+    if dst_bits == 32 && is_gp_reg(dst) {
+        let ext_id = alloc(next_id, IrType::SInt(64));
+        regs.set(&to_64bit_name(dst), ext_id);
+        stmts.push(Stmt::Assign {
+            lhs: ext_id, ty: IrType::SInt(64),
+            rhs: Expr::Cast { val: Value::Var { id: new_id, ty: dst_ty }, to: IrType::SInt(64) },
+        });
+    }
+    stmts
+}
+
+/// `div`/`idiv` — unsigned or signed division of (rdx:rax) by src.
+///
+/// Full x86 semantics require the 128-bit dividend rdx:rax; we approximate
+/// with rax only (sufficient for the common case where rdx was zeroed via
+/// `xor rdx, rdx` or sign-extended via `cqo`).
+/// Quotient → rax, remainder → rdx.
+fn lift_div(src: &str, next_id: &mut u32, regs: &mut RegisterTable, signed: bool) -> Vec<Stmt> {
+    let dividend = reg_val("rax", regs);
+    let divisor  = operand_to_val(src, regs);
+    let (quot_op, rem_op, result_ty) = if signed {
+        (BinOp::SDiv, BinOp::SRem, IrType::SInt(64))
+    } else {
+        (BinOp::UDiv, BinOp::URem, IrType::UInt(64))
+    };
+    let (quot_id, _) = fresh(next_id, result_ty.clone());
+    let (rem_id,  _) = fresh(next_id, result_ty.clone());
+    regs.set("rax", quot_id);
+    regs.set("rdx", rem_id);
+    vec![
+        Stmt::Assign { lhs: quot_id, ty: result_ty.clone(),
+            rhs: Expr::BinOp { op: quot_op, lhs: dividend.clone(), rhs: divisor.clone() } },
+        Stmt::Assign { lhs: rem_id, ty: result_ty,
+            rhs: Expr::BinOp { op: rem_op,  lhs: dividend,         rhs: divisor } },
+    ]
 }
 
 fn lift_call(ops: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
@@ -641,6 +708,15 @@ fn alloc(next_id: &mut u32, _ty: IrType) -> u32 {
 }
 
 // ── Type helpers ──────────────────────────────────────────────────────────────
+
+/// Convert a type to its signed equivalent.  `SInt`, `Float`, and pointer
+/// types are returned unchanged — only `UInt(N)` becomes `SInt(N)`.
+fn to_signed(ty: &IrType) -> IrType {
+    match ty {
+        IrType::UInt(b) => IrType::SInt(*b),
+        other           => other.clone(),
+    }
+}
 
 fn reg_type(reg: &str) -> IrType {
     let r = normalize_reg(reg);

@@ -344,12 +344,17 @@ impl CBackend {
             if let Some(Stmt::Assign { rhs: Expr::BinOp { lhs: l, rhs: r, .. }, .. }) = cmp {
                 let lhs_r = resolve(l, copies);
                 let rhs_r = resolve(r, copies);
-                let (rel, negate) = branch_mnem_to_rel(&cond.branch_mnem);
-                let negated = if cond.negate { !negate } else { negate };
-                return if negated {
-                    format!("!({} {rel} {})", lhs_r.display(), rhs_r.display())
+                let (rel, is_signed) = branch_mnem_to_rel(&cond.branch_mnem);
+                // For signed branches, cast operands to their signed equivalents
+                // so C performs a signed comparison even if the declared type is
+                // unsigned.  When the lifter has already stamped SInt (e.g. after
+                // movsx/imul), signed_cast is a no-op.
+                let lhs_str = if is_signed { signed_cast(lhs_r) } else { lhs_r.display() };
+                let rhs_str = if is_signed { signed_cast(rhs_r) } else { rhs_r.display() };
+                return if cond.negate {
+                    format!("!({lhs_str} {rel} {rhs_str})")
                 } else {
-                    format!("{} {rel} {}", lhs_r.display(), rhs_r.display())
+                    format!("{lhs_str} {rel} {rhs_str}")
                 };
             }
         }
@@ -457,19 +462,41 @@ impl CBackend {
 
 // ── Branch mnemonic → relational operator ────────────────────────────────────
 
+/// Map an x86 branch mnemonic to `(operator, is_signed)`.
+///
+/// `is_signed` drives the cast in `emit_cond`: signed branches (`jl`, `jle`,
+/// `jg`, `jge`) require `(intN_t)` casts on their operands so that C
+/// performs a signed comparison even when the variable type is `uintN_t`.
 fn branch_mnem_to_rel(mnem: &str) -> (&'static str, bool) {
     match mnem {
         "je"  | "jz"   => ("==", false),
         "jne" | "jnz"  => ("!=", false),
-        "jl"  | "jnge" => ("<",  false),
-        "jle" | "jng"  => ("<=", false),
-        "jg"  | "jnle" => (">",  false),
-        "jge" | "jnl"  => (">=", false),
-        "jb"  | "jnae" => ("<",  false),
-        "jbe" | "jna"  => ("<=", false),
-        "ja"  | "jnbe" => (">",  false),
-        "jae" | "jnb"  => (">=", false),
+        "jl"  | "jnge" => ("<",  true),  // signed
+        "jle" | "jng"  => ("<=", true),  // signed
+        "jg"  | "jnle" => (">",  true),  // signed
+        "jge" | "jnl"  => (">=", true),  // signed
+        "jb"  | "jnae" => ("<",  false), // unsigned
+        "jbe" | "jna"  => ("<=", false), // unsigned
+        "ja"  | "jnbe" => (">",  false), // unsigned
+        "jae" | "jnb"  => (">=", false), // unsigned
         _              => ("!=", false),
+    }
+}
+
+/// Wrap a value display in a signed cast when the value's own type is unsigned.
+///
+/// If the value already has a signed type (`SInt`), no cast is emitted —
+/// this happens when the lifter has already stamped `SInt` (e.g. after
+/// `movsx` or `imul`).
+fn signed_cast(v: &Value) -> String {
+    let s = v.display();
+    match v.ty() {
+        IrType::SInt(_)  => s,
+        IrType::UInt(8)  => format!("(int8_t){s}"),
+        IrType::UInt(16) => format!("(int16_t){s}"),
+        IrType::UInt(32) => format!("(int32_t){s}"),
+        IrType::UInt(64) => format!("(int64_t){s}"),
+        _                => format!("(int64_t){s}"),
     }
 }
 
