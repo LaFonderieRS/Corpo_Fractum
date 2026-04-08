@@ -122,6 +122,13 @@ pub fn activate(app: &Application, rt: Handle, log_rx: async_channel::Receiver<L
     }
     header.pack_end(&lang_btn);
 
+    let about_btn = gtk4::Button::with_label("About");
+    about_btn.connect_clicked(move |btn| {
+        let parent = btn.root().and_then(|r| r.downcast::<ApplicationWindow>().ok());
+        show_about_dialog(parent.as_ref());
+    });
+    header.pack_end(&about_btn);
+
     // ── Window ────────────────────────────────────────────────────────────────
     let window = ApplicationWindow::builder()
         .application(app)
@@ -145,6 +152,37 @@ pub fn activate(app: &Application, rt: Handle, log_rx: async_channel::Receiver<L
             move || splash.dismiss(),
         );
     });
+}
+
+// ── About dialog ─────────────────────────────────────────────────────────────
+
+fn show_about_dialog(parent: Option<&ApplicationWindow>) {
+    let dialog = gtk4::AboutDialog::new();
+    dialog.set_program_name(Some("Corpo Fractum"));
+    dialog.set_version(Some(env!("CARGO_PKG_VERSION")));
+    dialog.set_comments(Some(
+        "From gods came man. From binary, came code.\n\n\
+         Open-source binary decompiler targeting x86-64, ELF, PE and Mach-O. \
+         Lifts machine code to a typed SSA intermediate representation and emits \
+         readable C, C++ or Rust pseudo-code. The entire toolchain — loader, \
+         disassembler, IR, analysis, codegen and UI — is written in pure Rust.",
+    ));
+    dialog.set_license_type(gtk4::License::Gpl30);
+    dialog.set_authors(&[
+        "Corpo Fractum Contributors",
+    ]);
+    dialog.set_system_information(Some(
+        "rustdec-loader   — ELF / PE / Mach-O parser        (goblin)\n\
+         rustdec-disasm   — multi-arch disassembler          (capstone-rs)\n\
+         rustdec-ir       — SSA intermediate representation\n\
+         rustdec-lift     — x86-64 instruction lifter\n\
+         rustdec-analysis — CFG · dominance · structuration\n\
+         rustdec-codegen  — C / C++ / Rust code generators\n\
+         rustdec-gui      — GTK4 application                 (gtk4-rs · Cairo · Tokio)",
+    ));
+    dialog.set_transient_for(parent);
+    dialog.set_modal(true);
+    dialog.present();
 }
 
 // ── File open dialog ──────────────────────────────────────────────────────────
