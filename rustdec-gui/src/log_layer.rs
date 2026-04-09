@@ -61,19 +61,51 @@ struct MessageVisitor {
 }
 
 impl tracing::field::Visit for MessageVisitor {
-    /// Called for `&str` literal fields (rare for the message field).
+    /// Called for `&str` literal fields.
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
             self.message = value.to_owned();
         }
     }
 
-    /// Called for all other fields, including `format_args!` messages.
-    /// `fmt::Arguments` implements `Debug` via `Display`, so we get the
-    /// formatted string without extra quotes.
+    /// Called for `format_args!` messages and other Debug-formatted fields.
+    ///
+    /// `fmt::Arguments` formats to its Display representation when printed
+    /// with `{:?}`, but that wraps the result in double-quotes.  We strip
+    /// those quotes and unescape the common escape sequences so the console
+    /// shows the raw message text.
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            self.message = format!("{value:?}");
+            let raw = format!("{:?}", value);
+            // Debug on fmt::Arguments adds surrounding quotes — strip them.
+            self.message = if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+                unescape_debug_str(&raw[1..raw.len() - 1])
+            } else {
+                raw
+            };
         }
     }
+}
+
+/// Unescape the subset of Rust Debug escape sequences used by `fmt::Arguments`.
+fn unescape_debug_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"')  => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n')  => out.push('\n'),
+                Some('r')  => out.push('\r'),
+                Some('t')  => out.push('\t'),
+                Some('0')  => out.push('\0'),
+                Some(c)    => { out.push('\\'); out.push(c); }
+                None       => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }

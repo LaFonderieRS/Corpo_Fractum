@@ -19,7 +19,7 @@ rust-version = "1.78"
 
 [workspace.dependencies]
 # Binary parsing
-goblin = { version = "^0.10", default-features = false, features = ["elf64", "elf32", "pe32", "pe64", "mach64", "mach32", "te"] }
+goblin = { version = "^0.10", default-features = false, features = ["elf64", "elf32", "pe32", "pe64", "mach64", "mach32", "te", "endian_fd"] }
 gimli   = { version = "0.31", default-features = false, features = ["read", "endian-reader"] }
 
 # Disassembly

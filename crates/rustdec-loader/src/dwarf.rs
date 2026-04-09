@@ -139,6 +139,7 @@ pub enum DwarfLanguage {
     Rust,
     Go,
     Ada,
+    Cobol,
     Fortran,
     Java,
     Swift,
@@ -682,7 +683,7 @@ fn read_enum_variants<R: Reader>(
 // ── Line table ────────────────────────────────────────────────────────────────
 
 fn read_line_table<R: Reader>(
-    _dwarf: &Dwarf<R>,
+    dwarf: &Dwarf<R>,
     unit: &Unit<R>,
     out: &mut DwarfInfo,
 ) {
@@ -699,22 +700,39 @@ fn read_line_table<R: Reader>(
 
             // Resolve file name.
             let file = row.file(header_ref).and_then(|f| {
+                // Resolve directory — index 0 means the compilation directory.
                 let dir = if f.directory_index() == 0 {
-                    // Comp dir.
                     unit.comp_dir.clone()
                         .and_then(|d| d.to_string().ok().map(|s| s.to_string()))
                         .unwrap_or_default()
                 } else {
                     header_ref.directory(f.directory_index())
-                        .and_then(|d| match d {
-                            AttributeValue::String(s) => s.to_string().ok().map(|s| s.to_string()),
-                            _ => None,
+                        .and_then(|d| {
+                            // DWARF 4: inline string.  DWARF 5+: may be a
+                            // DebugLineStrRef or DebugStrRef — resolve via dwarf.
+                            match d {
+                                AttributeValue::String(s) =>
+                                    s.to_string().ok().map(|s| s.to_string()),
+                                AttributeValue::DebugLineStrRef(_)
+                                | AttributeValue::DebugStrRef(_) => {
+                                    dwarf.attr_string(unit, d).ok()
+                                        .and_then(|s| s.to_string().ok().map(|c| c.into_owned()))
+                                }
+                                _ => None,
+                            }
                         })
                         .unwrap_or_default()
                 };
 
+                // Resolve the file base name — same strategy.
                 let base = match f.path_name() {
-                    AttributeValue::String(s) => s.to_string().ok()?.to_string(),
+                    AttributeValue::String(s) =>
+                        s.to_string().ok()?.to_string(),
+                    AttributeValue::DebugLineStrRef(_)
+                    | AttributeValue::DebugStrRef(_) => {
+                        dwarf.attr_string(unit, f.path_name()).ok()
+                            .and_then(|s| s.to_string().ok().map(|c| c.into_owned()))?
+                    }
                     _ => return None,
                 };
 
@@ -753,7 +771,7 @@ fn attr_string<R: Reader>(
     name: gimli::DwAt,
 ) -> Option<String> {
     let av = entry.attr_value(name).ok()??;
-    dwarf.attr_string(unit, av).ok()?.to_string().ok().map(|s| s.to_string())
+    dwarf.attr_string(unit, av).ok()?.to_string().ok().map(|s| s.into_owned())
 }
 
 /// Read a DW_AT_* address attribute (DW_FORM_addr).
@@ -820,7 +838,7 @@ fn lang_from_u64(v: u64) -> DwarfLanguage {
         0x0002 => DwarfLanguage::C,         // DW_LANG_C
         0x0004 => DwarfLanguage::Cpp,       // DW_LANG_C_plus_plus
         0x0005 => DwarfLanguage::Ada,       // DW_LANG_Ada83
-        0x0006 => DwarfLanguage::Fortran,   // DW_LANG_Cobol74 — mapped to Fortran for brevity
+        0x0006 => DwarfLanguage::Cobol,      // DW_LANG_Cobol74
         0x0007 => DwarfLanguage::Fortran,   // DW_LANG_Fortran77
         0x0008 => DwarfLanguage::Fortran,   // DW_LANG_Fortran90
         0x000B => DwarfLanguage::Java,      // DW_LANG_Java
