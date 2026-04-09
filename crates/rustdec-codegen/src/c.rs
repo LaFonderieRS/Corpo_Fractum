@@ -1,28 +1,4 @@
 //! C99 pseudo-code backend — structured output using if/while/for.
-//!
-//! ## P1 improvements applied in this version
-//!
-//! ### Variable hoisting
-//! All SSA variable declarations (`uint64_t vN`) are collected in a first pass
-//! and emitted at the top of the function body, one per unique (id, type) pair.
-//! This produces valid C even when the structured tree visits a variable
-//! multiple times (e.g. after a loop back-edge).
-//!
-//! ### Copy-propagation
-//! Before emitting, we build a substitution table of trivial assignments of
-//! the form `vN = vM` (identity copies) or `vN = <const>`.  When emitting
-//! expressions, every `vN` that has a substitution is replaced inline.
-//! This eliminates the chains of temporaries the SSA lifter produces:
-//!
-//! ```c
-//! // Before:   uint64_t v12 = v4;  uint64_t v13 = v12;  foo(v13)
-//! // After:    foo(v4)
-//! ```
-//!
-//! The substitution is intentionally conservative:
-//! - Only pure `Expr::Value` RHS are propagated (no side-effects).
-//! - A variable is only substituted if it is assigned exactly once in the
-//!   whole function (checked via the use-count map built in the first pass).
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,10 +9,13 @@ use tracing::{debug, trace, warn};
 
 use crate::{CodegenBackend, CodegenResult};
 
-/// C99 code generation backend.
-///
-/// `string_table` is optional — when provided, `Expr::StringRef` nodes
-/// are emitted as C string literals instead of hex addresses.
+// ── Convenience type aliases used throughout this module ──────────────────────
+
+type SlotMap  = std::collections::HashMap<i64, rustdec_ir::StackSlot>;
+type RegNames = HashMap<u32, String>;
+
+// ── Backend struct ────────────────────────────────────────────────────────────
+
 pub struct CBackend {
     pub string_table: HashMap<u64, String>,
 }
@@ -59,14 +38,11 @@ impl CodegenBackend for CBackend {
 
         let blocks: Vec<&BasicBlock> = func.blocks_sorted();
 
-        // ── Pass 1: collect variables, copy table, and written-var set ─────────
-        let mut var_decls: HashMap<u32, IrType> = HashMap::new();
-        let mut assign_count: HashMap<u32, usize> = HashMap::new();
-        // Maps vN → Value when vN = <pure copy>
-        let mut copy_table: HashMap<u32, Value> = HashMap::new();
-        // SSA IDs that were explicitly written somewhere in this function.
-        // Used to filter spurious ABI placeholder arguments from calls.
-        let mut written_vars: HashSet<u32> = HashSet::new();
+        // ── Pass 1: collect variables, copy table, written-var set ────────────
+        let mut var_decls:    HashMap<u32, IrType> = HashMap::new();
+        let mut assign_count: HashMap<u32, usize>  = HashMap::new();
+        let mut copy_table:   HashMap<u32, Value>  = HashMap::new();
+        let mut written_vars: HashSet<u32>          = HashSet::new();
 
         for bb in &blocks {
             for stmt in &bb.stmts {
@@ -81,13 +57,8 @@ impl CodegenBackend for CBackend {
             }
         }
 
-        // Only propagate variables assigned exactly once (safe in SSA).
         copy_table.retain(|id, _| assign_count.get(id).copied().unwrap_or(0) == 1);
-
-        // Flatten the copy table transitively (vA→vB→vC becomes vA→vC).
-        let copy_table = flatten_copies(copy_table);
-
-        // Variables that are copy-propagated away don't need declarations.
+        let copy_table  = flatten_copies(copy_table);
         let suppressed: HashSet<u32> = copy_table.keys().copied().collect();
 
         // ── Emit function header ──────────────────────────────────────────────
@@ -98,21 +69,25 @@ impl CodegenBackend for CBackend {
         // ── Emit variable declarations (hoisted) ──────────────────────────────
         let mut decl_lines: Vec<String> = var_decls
             .iter()
-            .filter(|(id, _)| !suppressed.contains(id))
+            .filter(|(id, _)| {
+                !suppressed.contains(id)
+                    && !is_slot_id(**id)
+                    && !func.reg_names.contains_key(id)
+            })
             .map(|(id, ty)| format!("  {} v{id};", self.emit_type(ty)))
             .collect();
-        decl_lines.sort(); // deterministic output
+        decl_lines.sort();
         if !decl_lines.is_empty() {
-            for line in &decl_lines {
-                out.push_str(line);
-                out.push('\n');
-            }
+            for line in &decl_lines { out.push_str(line); out.push('\n'); }
             out.push('\n');
         }
 
         // ── Emit structured body ──────────────────────────────────────────────
         let structured = structure_function(func);
-        self.emit_node(&structured.root, &structured, &copy_table, &written_vars, &func.slot_table, &mut out, 1);
+        let slots     = &func.slot_table;
+        let reg_names = &func.reg_names;
+        self.emit_node(&structured.root, &structured, &copy_table,
+                       &written_vars, slots, reg_names, &mut out, 1);
 
         out.push_str("}\n");
         debug!(func = %func.name, lines = out.lines().count(),
@@ -137,20 +112,13 @@ impl CodegenBackend for CBackend {
             IrType::Array { elem, len } => format!("{}[{len}]", self.emit_type(elem)),
             IrType::Struct { name, .. } => format!("struct {name}"),
             IrType::Void                => "void".into(),
-            other => {
-                warn!(ty = ?other, "C: unknown type");
-                "/* unknown */".into()
-            }
+            other => { warn!(ty = ?other, "C: unknown type"); "/* unknown */".into() }
         }
     }
 }
 
-// ── Copy-propagation helper ───────────────────────────────────────────────────
+// ── Copy-propagation helpers ──────────────────────────────────────────────────
 
-/// Flatten a copy table transitively.
-///
-/// If `table[A] = Var(B)` and `table[B] = Var(C)`, replace both with `Var(C)`.
-/// Stops after 16 iterations to guard against cycles (shouldn't happen in SSA).
 fn flatten_copies(mut table: HashMap<u32, Value>) -> HashMap<u32, Value> {
     for _ in 0..16 {
         let mut changed = false;
@@ -168,32 +136,34 @@ fn flatten_copies(mut table: HashMap<u32, Value>) -> HashMap<u32, Value> {
     table
 }
 
-/// Resolve a `Value` through the copy-propagation table.
 fn resolve<'a>(v: &'a Value, copies: &'a HashMap<u32, Value>) -> &'a Value {
     if let Value::Var { id, .. } = v {
         if let Some(subst) = copies.get(id) {
-            return resolve(subst, copies); // one level of recursion is safe post-flatten
+            return resolve(subst, copies);
         }
     }
     v
 }
 
-/// Display a `Value`, substituting named slot variables where possible.
-///
-/// If the value's SSA id corresponds to a stack slot, we return the
-/// slot name (`local_0`, `arg_1`, …) instead of `vN`.
+// ── Value display ─────────────────────────────────────────────────────────────
+
+/// Display a `Value` with slot and register-name substitutions.
 fn display_value(
-    v:          &Value,
-    copies:     &HashMap<u32, Value>,
-    slot_table: &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
+    v:         &Value,
+    copies:    &HashMap<u32, Value>,
+    slots:     &SlotMap,
+    reg_names: &RegNames,
 ) -> String {
     let resolved = resolve(v, copies);
     if let Value::Var { id, .. } = resolved {
         if is_slot_id(*id) {
             let offset = slot_id_to_offset(*id);
-            if let Some(slot) = slot_table.get(&offset) {
+            if let Some(slot) = slots.get(&offset) {
                 return format!("&{}", slot.name);
             }
+        }
+        if let Some(name) = reg_names.get(id) {
+            return name.to_string();
         }
     }
     resolved.display()
@@ -202,38 +172,37 @@ fn display_value(
 // ── Structured tree emitter ───────────────────────────────────────────────────
 
 impl CBackend {
-    fn indent(depth: usize) -> String {
-        "  ".repeat(depth)
-    }
+    fn indent(depth: usize) -> String { "  ".repeat(depth) }
 
     fn emit_node(
         &self,
-        node:    &SNode,
-        sfunc:   &rustdec_analysis::StructuredFunc,
-        copies:  &HashMap<u32, Value>,
-        written: &HashSet<u32>,
-        _slots:  &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
-        out:     &mut String,
-        depth:   usize,
+        node:      &SNode,
+        sfunc:     &rustdec_analysis::StructuredFunc,
+        copies:    &HashMap<u32, Value>,
+        written:   &HashSet<u32>,
+        slots:     &SlotMap,
+        reg_names: &RegNames,
+        out:       &mut String,
+        depth:     usize,
     ) {
         let ind = Self::indent(depth);
         match node {
             SNode::Block(id) => {
                 if let Some(bb) = sfunc.blocks.get(id) {
                     trace!(block = format_args!("{:#x}", bb.start_addr),
-                           stmts = bb.stmts.len(),
-                           "C: emit block");
+                           stmts = bb.stmts.len(), "C: emit block");
                     for stmt in &bb.stmts {
-                        if let Some(line) = self.emit_stmt_opt(stmt, copies, written, _slots) {
+                        if let Some(line) = self.emit_stmt_opt(
+                            stmt, copies, written, slots, reg_names)
+                        {
                             out.push_str(&format!("{ind}{line};\n"));
                         }
                     }
-                    // Return statement — value already patched by lifter.
                     match &bb.terminator {
                         Terminator::Return(Some(v)) => {
-                            let resolved = resolve(v, copies);
-                            out.push_str(&format!("{ind}return {};\n",
-                                                  resolved.display()));
+                            let r = resolve(v, copies);
+                            let s = display_value(r, copies, slots, reg_names);
+                            out.push_str(&format!("{ind}return {s};\n"));
                         }
                         Terminator::Return(None) => {
                             out.push_str(&format!("{ind}return;\n"));
@@ -245,16 +214,17 @@ impl CBackend {
 
             SNode::Seq(nodes) => {
                 for n in nodes {
-                    self.emit_node(n, sfunc, copies, written, _slots, out, depth);
+                    self.emit_node(n, sfunc, copies, written, slots, reg_names, out, depth);
                 }
             }
 
             SNode::IfElse { cond, then, else_ } => {
-                let cond_str = self.emit_cond(cond, sfunc, copies, written, _slots);
+                let cond_str = self.emit_cond(cond, sfunc, copies, written, slots, reg_names);
                 out.push_str(&format!("{ind}if ({cond_str}) {{\n"));
-                self.emit_node(then, sfunc, copies, written, _slots, out, depth + 1);
+                self.emit_node(then, sfunc, copies, written, slots, reg_names, out, depth + 1);
                 let mut else_buf = String::new();
-                self.emit_node(else_, sfunc, copies, written, _slots, &mut else_buf, depth + 1);
+                self.emit_node(else_, sfunc, copies, written, slots, reg_names,
+                               &mut else_buf, depth + 1);
                 if !else_buf.trim().is_empty() {
                     out.push_str(&format!("{ind}}} else {{\n"));
                     out.push_str(&else_buf);
@@ -263,9 +233,9 @@ impl CBackend {
             }
 
             SNode::Loop { cond, body } => {
-                let cond_str = self.emit_cond(cond, sfunc, copies, written, _slots);
+                let cond_str = self.emit_cond(cond, sfunc, copies, written, slots, reg_names);
                 out.push_str(&format!("{ind}while ({cond_str}) {{\n"));
-                self.emit_node(body, sfunc, copies, written, _slots, out, depth + 1);
+                self.emit_node(body, sfunc, copies, written, slots, reg_names, out, depth + 1);
                 out.push_str(&format!("{ind}}}\n"));
             }
 
@@ -274,67 +244,66 @@ impl CBackend {
         }
     }
 
-    /// Emit one statement, or `None` if it should be suppressed.
-    ///
-    /// Assignments of the form `vN = vM` where `vN` is in the copy table
-    /// are suppressed entirely — the substitution happens at use-sites.
-    /// `Stmt::Nop` is always suppressed.
     fn emit_stmt_opt(
         &self,
-        stmt:   &Stmt,
-        copies: &HashMap<u32, Value>,
-        written: &HashSet<u32>,
-        _slots:  &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
+        stmt:      &Stmt,
+        copies:    &HashMap<u32, Value>,
+        written:   &HashSet<u32>,
+        slots:     &SlotMap,
+        reg_names: &RegNames,
     ) -> Option<String> {
         match stmt {
             Stmt::Nop => None,
 
             Stmt::Assign { lhs, ty: _, rhs } => {
-                // Suppress if this variable is copy-propagated away.
-                if copies.contains_key(lhs) {
-                    return None;
-                }
-                let rhs_str = self.emit_expr_resolved(rhs, copies, written, _slots);
-                // Emit as assignment (no type — variables are declared at top).
-                // Slot vars are never assigned to directly (they are addressed
-                // via their pointer), so we suppress them here.
-                if is_slot_id(*lhs) {
-                    return None;
-                }
+                if copies.contains_key(lhs) { return None; }
+                if is_slot_id(*lhs)          { return None; }
+                // Suppress assignments to ABI seed registers that were never
+                // written by the function body (they are implicit inputs).
+                if reg_names.contains_key(lhs) { return None; }
+
+                let rhs_str = self.emit_expr_resolved(rhs, copies, written, slots, reg_names);
                 Some(format!("v{lhs} = {rhs_str}"))
             }
 
             Stmt::Store { ptr, val } => {
                 let ptr_r = resolve(ptr, copies);
                 let val_r = resolve(val, copies);
+
+                // Suppress stores through a known-null pointer.
+                if matches!(ptr_r, Value::Const { val: 0, .. }) {
+                    return Some("/* NULL store suppressed */".to_string());
+                }
+
                 // Slot store → named assignment.
                 if let Value::Var { id, .. } = ptr_r {
                     if is_slot_id(*id) {
                         let offset = slot_id_to_offset(*id);
-                        if let Some(slot) = _slots.get(&offset) {
+                        if let Some(slot) = slots.get(&offset) {
                             return Some(format!("{} = {}", slot.name, val_r.display()));
                         }
                     }
                 }
-                Some(format!("*({}) = {}", ptr_r.display(), val_r.display()))
+                let ptr_s = display_value(ptr_r, copies, slots, reg_names);
+                let val_s = display_value(val_r, copies, slots, reg_names);
+                Some(format!("*({ptr_s}) = {val_s}"))
             }
         }
     }
 
-    /// Emit a condition expression for `if`/`while` headers.
     fn emit_cond(
         &self,
-        cond:    &CondExpr,
-        sfunc:   &rustdec_analysis::StructuredFunc,
-        copies:  &HashMap<u32, Value>,
-        _written: &HashSet<u32>,
-        _slots:  &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
+        cond:      &CondExpr,
+        sfunc:     &rustdec_analysis::StructuredFunc,
+        copies:    &HashMap<u32, Value>,
+        _written:  &HashSet<u32>,
+        slots:     &SlotMap,
+        reg_names: &RegNames,
     ) -> String {
         let bb = sfunc.blocks.values()
             .find(|b| b.start_addr == cond.block_addr);
 
         if let Some(bb) = bb {
-            // Find the last cmp/test — it produced the flag variable.
             let cmp = bb.stmts.iter().rev().find(|s| {
                 matches!(s, Stmt::Assign {
                     rhs: Expr::BinOp { op: BinOp::Sub | BinOp::And, .. }, ..
@@ -345,16 +314,14 @@ impl CBackend {
                 let lhs_r = resolve(l, copies);
                 let rhs_r = resolve(r, copies);
                 let (rel, is_signed) = branch_mnem_to_rel(&cond.branch_mnem);
-                // For signed branches, cast operands to their signed equivalents
-                // so C performs a signed comparison even if the declared type is
-                // unsigned.  When the lifter has already stamped SInt (e.g. after
-                // movsx/imul), signed_cast is a no-op.
-                let lhs_str = if is_signed { signed_cast(lhs_r) } else { lhs_r.display() };
-                let rhs_str = if is_signed { signed_cast(rhs_r) } else { rhs_r.display() };
+                let lhs_s = if is_signed { signed_cast(lhs_r) }
+                            else { display_value(lhs_r, copies, slots, reg_names) };
+                let rhs_s = if is_signed { signed_cast(rhs_r) }
+                            else { display_value(rhs_r, copies, slots, reg_names) };
                 return if cond.negate {
-                    format!("!({lhs_str} {rel} {rhs_str})")
+                    format!("!({lhs_s} {rel} {rhs_s})")
                 } else {
-                    format!("{lhs_str} {rel} {rhs_str}")
+                    format!("{lhs_s} {rel} {rhs_s}")
                 };
             }
         }
@@ -362,35 +329,33 @@ impl CBackend {
         format!("cond_{:x}", cond.block_addr)
     }
 
-    // ── Expression emitters ───────────────────────────────────────────────────
-
     fn emit_expr_resolved(
         &self,
-        expr:    &Expr,
-        copies:  &HashMap<u32, Value>,
-        written: &HashSet<u32>,
-        _slots:  &std::collections::HashMap<i64, rustdec_ir::StackSlot>,
+        expr:      &Expr,
+        copies:    &HashMap<u32, Value>,
+        written:   &HashSet<u32>,
+        slots:     &SlotMap,
+        reg_names: &RegNames,
     ) -> String {
         match expr {
-            Expr::Value(v) => resolve(v, copies).display(),
+            Expr::Value(v) => display_value(v, copies, slots, reg_names),
 
             Expr::BinOp { op, lhs, rhs } => {
-                let l = resolve(lhs, copies);
-                let r = resolve(rhs, copies);
-                format!("({} {} {})", l.display(), binop_c(op), r.display())
+                let l = display_value(lhs, copies, slots, reg_names);
+                let r = display_value(rhs, copies, slots, reg_names);
+                format!("({l} {} {r})", binop_c(op))
             }
 
             Expr::Load { ptr, ty } => {
-                let p = display_value(ptr, copies, _slots);
-                // If the ptr is a slot reference, emit as named variable access.
                 if let Value::Var { id, .. } = resolve(ptr, copies) {
                     if is_slot_id(*id) {
                         let offset = slot_id_to_offset(*id);
-                        if let Some(slot) = _slots.get(&offset) {
+                        if let Some(slot) = slots.get(&offset) {
                             return slot.name.clone();
                         }
                     }
                 }
+                let p = display_value(ptr, copies, slots, reg_names);
                 format!("*({}*){}", self.emit_type(ty), p)
             }
 
@@ -404,30 +369,16 @@ impl CBackend {
                         format!("(*(void*(*)(...))({}))", r.display())
                     }
                 };
-                // P2 — use-def argument filtering.
-                //
-                // The lifter always passes the 6 SysV ABI registers (rdi, rsi,
-                // rdx, rcx, r8, r9) as arguments to every call, regardless of
-                // whether the callee actually uses them.  After copy-propagation
-                // these resolve to their SSA IDs at the point of the call.
-                //
-                // An argument is considered "real" (i.e. intentionally set before
-                // this call) if, after resolution, it refers to a variable that
-                // was written somewhere in the current function.  Arguments that
-                // resolve to a Const are always real.  Arguments that resolve to
-                // a Var whose ID was never written in this function are ABI
-                // placeholders and are suppressed.
                 let filtered: Vec<String> = args
                     .iter()
                     .filter_map(|a| {
                         let r = resolve(a, copies);
                         match r {
-                            Value::Const { .. } => Some(r.display()),
+                            Value::Const { .. } => Some(display_value(r, copies, slots, reg_names)),
                             Value::Var { id, .. } => {
                                 if written.contains(id) {
-                                    Some(r.display())
+                                    Some(display_value(r, copies, slots, reg_names))
                                 } else {
-                                    // Unwritten ABI register — suppress.
                                     None
                                 }
                             }
@@ -439,20 +390,12 @@ impl CBackend {
 
             Expr::Cast { val, to } => {
                 let v = resolve(val, copies);
-                format!("({}){}", self.emit_type(to), v.display())
+                format!("({}){}", self.emit_type(to), display_value(v, copies, slots, reg_names))
             }
 
-            Expr::Opaque(s) => {
-                // Opaque expressions come from unmodelled instructions or
-                // address computations that could not be reduced to IR.
-                // Emit as a line comment so the C remains syntactically valid
-                // (the surrounding emit_stmt_opt wraps this in a statement).
-                format!("/* {s} */")
-            }
+            Expr::Opaque(s) => format!("/* {s} */"),
 
             Expr::StringRef { addr, content } => {
-                // Emit as a C string literal with proper escaping.
-                // If the string_table has a higher-fidelity version, use it.
                 let text = self.string_table.get(addr).unwrap_or(content);
                 format!("\"{}\"", escape_c_string(text))
             }
@@ -462,32 +405,22 @@ impl CBackend {
 
 // ── Branch mnemonic → relational operator ────────────────────────────────────
 
-/// Map an x86 branch mnemonic to `(operator, is_signed)`.
-///
-/// `is_signed` drives the cast in `emit_cond`: signed branches (`jl`, `jle`,
-/// `jg`, `jge`) require `(intN_t)` casts on their operands so that C
-/// performs a signed comparison even when the variable type is `uintN_t`.
 fn branch_mnem_to_rel(mnem: &str) -> (&'static str, bool) {
     match mnem {
         "je"  | "jz"   => ("==", false),
         "jne" | "jnz"  => ("!=", false),
-        "jl"  | "jnge" => ("<",  true),  // signed
-        "jle" | "jng"  => ("<=", true),  // signed
-        "jg"  | "jnle" => (">",  true),  // signed
-        "jge" | "jnl"  => (">=", true),  // signed
-        "jb"  | "jnae" => ("<",  false), // unsigned
-        "jbe" | "jna"  => ("<=", false), // unsigned
-        "ja"  | "jnbe" => (">",  false), // unsigned
-        "jae" | "jnb"  => (">=", false), // unsigned
+        "jl"  | "jnge" => ("<",  true),
+        "jle" | "jng"  => ("<=", true),
+        "jg"  | "jnle" => (">",  true),
+        "jge" | "jnl"  => (">=", true),
+        "jb"  | "jnae" => ("<",  false),
+        "jbe" | "jna"  => ("<=", false),
+        "ja"  | "jnbe" => (">",  false),
+        "jae" | "jnb"  => (">=", false),
         _              => ("!=", false),
     }
 }
 
-/// Wrap a value display in a signed cast when the value's own type is unsigned.
-///
-/// If the value already has a signed type (`SInt`), no cast is emitted —
-/// this happens when the lifter has already stamped `SInt` (e.g. after
-/// `movsx` or `imul`).
 fn signed_cast(v: &Value) -> String {
     let s = v.display();
     match v.ty() {
@@ -499,8 +432,6 @@ fn signed_cast(v: &Value) -> String {
         _                => format!("(int64_t){s}"),
     }
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn binop_c(op: &BinOp) -> &'static str {
     match op {
@@ -521,19 +452,18 @@ fn binop_c(op: &BinOp) -> &'static str {
     }
 }
 
-/// Escape a string for use as a C string literal.
 fn escape_c_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '"'  => out.push_str("\\\""),
-            '\\'  => out.push_str("\\\\"),
-            '\n'  => out.push_str("\\n"),
-            '\r'  => out.push_str("\\r"),
-            '\t'  => out.push_str("\\t"),
-            '\0'  => out.push_str("\\0"),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
             c if c.is_ascii_graphic() || c == ' ' => out.push(c),
-            c    => { let _ = c; out.push_str("?"); }
+            _    => out.push('?'),
         }
     }
     out

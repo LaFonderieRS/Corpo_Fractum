@@ -249,6 +249,11 @@ pub struct IrFunction {
     /// Total frame size in bytes (deduced from `sub rsp, N` in prologue).
     /// Zero if the prologue was not recognised.
     pub frame_size:  u64,
+    /// Maps SSA seed ids → canonical register name (e.g. 14 → "rdi").
+    /// Populated by the lifter for ABI-seeded registers so the codegen
+    /// can emit `rdi` instead of `v14` for unwritten input registers.
+    #[serde(default)]
+    pub reg_names:   HashMap<u32, String>,
 }
 
 impl IrFunction {
@@ -262,6 +267,7 @@ impl IrFunction {
             next_var_id: 0,
             slot_table:  HashMap::new(),
             frame_size:  0,
+            reg_names:   HashMap::new(),
         }
     }
 

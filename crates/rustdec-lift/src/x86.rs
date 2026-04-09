@@ -34,13 +34,27 @@ pub struct FlagTracker {
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Lift a block and return `(stmts, rax_id_at_end)`.
+///
+/// The `RegisterTable` is pre-seeded with the System V x86-64 ABI calling
+/// convention registers so that reads of `rsp`, `rdi`, `rsi`, etc. before
+/// any assignment produce real SSA ids instead of placeholder sentinels.
+///
+/// Each ABI register is allocated a fresh SSA id at the start so that:
+/// - The codegen sees proper variable names rather than `v906`.
+/// - Copy-propagation can eliminate trivial copies.
+/// - Frame analysis correctly identifies rbp/rsp chains.
 pub fn lift_block_with_regs(
     insns:   &[&Instruction],
     next_id: &mut u32,
-) -> (Vec<Stmt>, Option<u32>) {
+) -> (Vec<Stmt>, Option<u32>, HashMap<u32, String>) {
     let mut stmts = Vec::new();
     let mut regs  = RegisterTable::default();
     let mut flags = FlagTracker::default();
+
+    // Seed ABI registers and capture the id → name table so the codegen
+    // can substitute "rdi" for "v14" when the register is used but never
+    // written (i.e. it enters the block as an implicit input).
+    let reg_names = seed_abi_regs(&mut regs, next_id);
 
     for insn in insns {
         let new = lift_insn(insn, next_id, &mut regs, &mut flags);
@@ -54,7 +68,43 @@ pub fn lift_block_with_regs(
         stmts.extend(new);
     }
     let rax_id = regs.get("rax");
-    (stmts, rax_id)
+    (stmts, rax_id, reg_names)
+}
+
+
+/// Pre-allocate SSA ids for the System V x86-64 ABI registers.
+///
+/// We seed both caller-saved (rdi…r9, rax) and callee-saved (rbx, r12…r15)
+/// registers plus the stack and frame pointers.  This prevents placeholder
+/// sentinel ids (900-931) from leaking into the codegen output.
+///
+/// The allocated ids are intentionally *not* emitted as IR statements —
+/// they represent the implicit "input" values of the block.
+fn seed_abi_regs(regs: &mut RegisterTable, next_id: &mut u32) -> HashMap<u32, String> {
+    let mut names: HashMap<u32, String> = HashMap::new();
+
+    // Seed list: (canonical 64-bit name, all aliases).
+    // We register the canonical name for every id so the codegen can
+    // print "rdi" regardless of which alias appeared in the assembly.
+    const ABI_REGS: &[&str] = &[
+        "rdi", "rsi", "rdx", "rcx", "r8", "r9",
+        "rax", "r10", "r11",          // caller-saved
+        "rbx", "r12", "r13", "r14", "r15", // callee-saved
+        "rsp", "rbp",                  // stack / frame
+    ];
+
+    for &reg in ABI_REGS {
+        let ty = if reg == "rsp" || reg == "rbp" {
+            IrType::UInt(64)
+        } else {
+            reg_type(reg)
+        };
+        let (id, _) = fresh(next_id, ty);
+        regs.set(reg, id);
+        names.insert(id, reg.to_string());
+    }
+
+    names
 }
 
 /// Convenience wrapper — drops the rax id.
