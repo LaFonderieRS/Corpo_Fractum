@@ -10,6 +10,10 @@ use tracing::{debug, info, instrument, warn};
 
 pub use arch::Arch;
 pub use binary::{BinaryObject, Endian, Format, Section, SectionKind, Symbol, SymbolKind};
+pub use dwarf::{
+    CompUnit, DwarfField, DwarfFunction, DwarfInfo, DwarfLanguage, DwarfLocalVar, DwarfParam,
+    DwarfType, DwarfTypeKind, LineEntry,
+};
 pub use strings::{extract_strings, StringTable};
 
 #[derive(Debug, Error)]
@@ -27,9 +31,10 @@ pub enum LoadError {
 pub type LoadResult<T> = Result<T, LoadError>;
 
 mod arch;
-mod strings;
 mod binary;
+pub mod dwarf;
 mod loaders;
+mod strings;
 
 /// Load a binary from disk.
 #[instrument(skip_all, fields(path = %path.as_ref().display()))]
@@ -90,6 +95,18 @@ pub fn load_bytes(bytes: &[u8]) -> LoadResult<BinaryObject> {
         }
         _ => Err(LoadError::UnknownFormat),
     }?;
+
+    let dwarf = dwarf::parse(&obj);
+    if let Some(ref d) = dwarf {
+        debug!(
+            units     = d.units.len(),
+            functions = d.functions.len(),
+            lines     = d.lines.len(),
+            types     = d.types.len(),
+            "DWARF debug info parsed"
+        );
+    }
+    let obj = BinaryObject { dwarf, ..obj };
 
     for sec in &obj.sections {
         debug!(

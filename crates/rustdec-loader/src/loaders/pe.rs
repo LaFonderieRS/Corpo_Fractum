@@ -76,6 +76,7 @@ pub fn load(pe: &PE<'_>, bytes: &[u8]) -> LoadResult<BinaryObject> {
         entry_point: Some(pe.entry as u64 + image_base),
         sections,
         symbols,
+        dwarf: None,
     })
 }
 

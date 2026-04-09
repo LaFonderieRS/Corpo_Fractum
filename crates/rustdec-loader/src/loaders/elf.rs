@@ -84,6 +84,7 @@ pub fn load(elf: &Elf<'_>, bytes: &[u8]) -> LoadResult<BinaryObject> {
         entry_point,
         sections,
         symbols,
+        dwarf: None,
     })
 }
 

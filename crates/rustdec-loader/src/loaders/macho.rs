@@ -47,6 +47,7 @@ pub fn load(macho: &MachO<'_>, _bytes: &[u8]) -> LoadResult<BinaryObject> {
         entry_point,
         sections,
         symbols,
+        dwarf: None,
     })
 }
 

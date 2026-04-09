@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 goblin.workspace    = true
+gimli.workspace     = true
 thiserror.workspace = true
 anyhow.workspace    = true
 serde.workspace     = true

@@ -1,5 +1,6 @@
 //! Normalised binary representation, independent of the source format.
 
+use crate::dwarf::DwarfInfo;
 use crate::Arch;
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +95,8 @@ pub struct BinaryObject {
     pub entry_point:  Option<u64>,
     pub sections:     Vec<Section>,
     pub symbols:      Vec<Symbol>,
+    /// DWARF debug information, if present in the binary.
+    pub dwarf:        Option<DwarfInfo>,
 }
 
 impl BinaryObject {

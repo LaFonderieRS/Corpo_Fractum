@@ -169,7 +169,7 @@ fn show_about_dialog(parent: Option<&ApplicationWindow>) {
     ));
     dialog.set_license_type(gtk4::License::Gpl30);
     dialog.set_authors(&[
-        "Corpo Fractum Contributors",
+        "Corpo Fractum Contributors - La Fonderie",
     ]);
     dialog.set_system_information(Some(
         "rustdec-loader   — ELF / PE / Mach-O parser        (goblin)\n\
