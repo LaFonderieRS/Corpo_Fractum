@@ -1,5 +1,8 @@
 //! Console panel — displays analysis lifecycle events and tracing log records.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use glib::MainContext;
 use gtk4::prelude::*;
 use gtk4::{
@@ -60,15 +63,20 @@ impl ConsolePanel {
         {
             let buf = buffer.clone();
             let view = view.clone();
+            let fn_count = Rc::new(Cell::new(0usize));
             bridge.subscribe(move |event| {
                 let (severity, msg) = match event {
-                    BridgeEvent::AnalysisStarted(path) => (
+                    BridgeEvent::AnalysisStarted(path) => {
+                        fn_count.set(0);
+                        ("info", format!("[info]  analysis started: {}", path.display()))
+                    }
+                    BridgeEvent::AnalysisFunctionReady(_, _) => {
+                        fn_count.set(fn_count.get() + 1);
+                        return;
+                    }
+                    BridgeEvent::AnalysisDone => (
                         "info",
-                        format!("[info]  analysis started: {}", path.display()),
-                    ),
-                    BridgeEvent::AnalysisDone(funcs) => (
-                        "info",
-                        format!("[info]  analysis done — {} function(s) lifted", funcs.len()),
+                        format!("[info]  analysis done — {} function(s) lifted", fn_count.get()),
                     ),
                     BridgeEvent::AnalysisError(msg) => (
                         "error",

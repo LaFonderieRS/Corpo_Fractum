@@ -63,24 +63,25 @@ impl ExplorerPanel {
         }
 
         // Subscribe to bridge events to populate the list.
+        // Clear on AnalysisStarted, append one row per AnalysisFunctionReady.
         {
             let list_ref = list.clone();
-            bridge.subscribe(move |event| {
-                if let BridgeEvent::AnalysisDone(funcs) = event {
-                    // Clear existing rows.
+            bridge.subscribe(move |event| match event {
+                BridgeEvent::AnalysisStarted(_) => {
                     while let Some(child) = list_ref.first_child() {
                         list_ref.remove(&child);
                     }
-                    for (name, _code) in &funcs {
-                        let label = Label::new(Some(name));
-                        label.set_halign(gtk4::Align::Start);
-                        label.set_margin_start(8);
-                        label.set_margin_end(8);
-                        label.set_margin_top(4);
-                        label.set_margin_bottom(4);
-                        list_ref.append(&label);
-                    }
                 }
+                BridgeEvent::AnalysisFunctionReady(name, _) => {
+                    let label = Label::new(Some(&name));
+                    label.set_halign(gtk4::Align::Start);
+                    label.set_margin_start(8);
+                    label.set_margin_end(8);
+                    label.set_margin_top(4);
+                    label.set_margin_bottom(4);
+                    list_ref.append(&label);
+                }
+                _ => {}
             });
         }
 

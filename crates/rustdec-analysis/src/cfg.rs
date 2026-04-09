@@ -25,15 +25,19 @@ use tracing::{debug, trace, warn};
 
 /// Build an [`IrFunction`] CFG.
 ///
-/// - `entry_addr` — virtual address of the function's first instruction.
-/// - `end_addr`   — first address **after** this function's last instruction.
-///                  Instructions at `addr >= end_addr` are ignored.
-/// - `insns`      — all instructions of the binary, sorted by address.
+/// - `entry_addr`  — virtual address of the function's first instruction.
+/// - `end_addr`    — first address **after** this function's last instruction.
+///                   Instructions at `addr >= end_addr` are ignored.
+/// - `insns`       — all instructions of the binary, sorted by address.
+/// - `addr_to_idx` — pre-built map from virtual address to index in `insns`
+///                   for O(1) entry-point lookup (build once, share across
+///                   parallel tasks).
 pub fn build_cfg(
-    name:       String,
-    entry_addr: u64,
-    end_addr:   u64,
-    insns:      &[Instruction],
+    name:        String,
+    entry_addr:  u64,
+    end_addr:    u64,
+    insns:       &[Instruction],
+    addr_to_idx: &HashMap<u64, usize>,
 ) -> IrFunction {
     let mut func = IrFunction::new(name.clone(), entry_addr);
 
@@ -44,10 +48,11 @@ pub fn build_cfg(
         "building CFG"
     );
 
-    // Locate the first instruction inside [entry_addr, end_addr).
-    let start_idx = match insns.binary_search_by_key(&entry_addr, |i| i.address) {
-        Ok(i)  => i,
-        Err(_) => {
+    // Locate the first instruction inside [entry_addr, end_addr) — O(1) via
+    // the pre-built address map instead of a binary search.
+    let start_idx = match addr_to_idx.get(&entry_addr) {
+        Some(&i) => i,
+        None => {
             warn!(func = %name, entry = format_args!("{:#x}", entry_addr),
                   "no instruction at entry point — empty CFG");
             return func;

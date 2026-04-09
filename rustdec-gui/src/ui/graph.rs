@@ -56,18 +56,28 @@ impl GraphPanel {
             .build();
         root.append(&scroll);
 
-        // Subscribe: rebuild node list on analysis done.
+        // Subscribe: accumulate function names as they stream in, then compute
+        // the graph layout on AnalysisDone and trigger a single redraw.
         // Runs on GTK main thread — Rc, RefCell, DrawingArea are all safe here.
         {
-            let nodes  = nodes.clone();
-            let canvas = canvas.clone();
-            bridge.subscribe(move |event| {
-                if let BridgeEvent::AnalysisDone(funcs) = event {
+            let nodes   = nodes.clone();
+            let canvas  = canvas.clone();
+            let pending: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+            bridge.subscribe(move |event| match event {
+                BridgeEvent::AnalysisStarted(_) => {
+                    *nodes.borrow_mut() = vec![];
+                    pending.borrow_mut().clear();
+                    canvas.queue_draw();
+                }
+                BridgeEvent::AnalysisFunctionReady(name, _) => {
+                    pending.borrow_mut().push(name);
+                }
+                BridgeEvent::AnalysisDone => {
                     let cols = 4usize;
-                    let layout: Vec<GraphNode> = funcs
+                    let layout: Vec<GraphNode> = pending.borrow()
                         .iter()
                         .enumerate()
-                        .map(|(i, (name, _))| GraphNode {
+                        .map(|(i, name)| GraphNode {
                             label: name.clone(),
                             x: 20.0 + (i % cols) as f64 * 190.0,
                             y: 20.0 + (i / cols) as f64 * 80.0,
@@ -78,6 +88,7 @@ impl GraphPanel {
                     *nodes.borrow_mut() = layout;
                     canvas.queue_draw();
                 }
+                BridgeEvent::AnalysisError(_) => {}
             });
         }
 

@@ -4,6 +4,9 @@
 //! Uses a [`gtk4::TextView`] in read-only mode with monospaced font and
 //! syntax-highlight placeholders via Pango tags.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Label, Orientation, PolicyType, ScrolledWindow,
@@ -72,22 +75,26 @@ impl CodePanel {
             .build();
         root.append(&scroll);
 
-        // Subscribe: on AnalysisDone, concat all function pseudo-code.
-        // The callback runs on the GTK main thread (via glib::idle_add_once),
-        // so TextBuffer (which is not Send) is safe to use here.
+        // Subscribe: stream pseudo-code into the buffer one function at a time.
+        // AnalysisFunctionReady events arrive sequentially on the GTK main thread,
+        // so TextBuffer (non-Send) is fully safe to mutate here.
         {
             let buf = buffer.clone();
+            let is_first = Rc::new(Cell::new(true));
             bridge.subscribe(move |event| match event {
                 BridgeEvent::AnalysisStarted(_) => {
                     buf.set_text("// Analysing binary…");
+                    is_first.set(true);
                 }
-                BridgeEvent::AnalysisDone(funcs) => {
-                    let combined = funcs
-                        .iter()
-                        .map(|(_, code)| code.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    buf.set_text(&combined);
+                BridgeEvent::AnalysisFunctionReady(_, code) => {
+                    if is_first.get() {
+                        buf.set_text(&code);
+                        is_first.set(false);
+                    } else {
+                        buf.insert(&mut buf.end_iter(), &format!("\n\n{code}"));
+                    }
+                }
+                BridgeEvent::AnalysisDone => {
                     apply_basic_highlighting(&buf);
                 }
                 BridgeEvent::AnalysisError(msg) => {

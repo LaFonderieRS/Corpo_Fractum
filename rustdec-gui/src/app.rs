@@ -49,9 +49,10 @@ pub fn activate(app: &Application, rt: Handle, log_rx: async_channel::Receiver<L
                 splash.set_status("Loading binary…");
                 splash.set_progress(0.1);
             }
-            BridgeEvent::AnalysisDone(_) | BridgeEvent::AnalysisError(_) => {
+            BridgeEvent::AnalysisDone | BridgeEvent::AnalysisError(_) => {
                 splash.dismiss();
             }
+            BridgeEvent::AnalysisFunctionReady(_, _) => {}
         });
     }
 

@@ -30,7 +30,10 @@ use rustdec_loader::load_file;
 #[derive(Debug, Clone)]
 pub enum BridgeEvent {
     AnalysisStarted(PathBuf),
-    AnalysisDone(Vec<(String, String)>),
+    /// Emitted once per function as codegen completes; carries `(name, code)`.
+    AnalysisFunctionReady(String, String),
+    /// Emitted after all functions have been streamed — signals completion.
+    AnalysisDone,
     AnalysisError(String),
 }
 
@@ -105,14 +108,17 @@ impl AnalysisBridge {
             })
             .await;
 
-            let event = match result {
-                Ok(Ok(code)) => BridgeEvent::AnalysisDone(code),
-                Ok(Err(msg)) => BridgeEvent::AnalysisError(msg),
-                Err(e)       => BridgeEvent::AnalysisError(e.to_string()),
-            };
-
-            // Send to GTK main thread — this is the only Send crossing.
-            let _ = tx.send(event).await;
+            // Stream one event per function so the UI populates progressively.
+            match result {
+                Ok(Ok(code)) => {
+                    for (name, src) in code {
+                        let _ = tx.send(BridgeEvent::AnalysisFunctionReady(name, src)).await;
+                    }
+                    let _ = tx.send(BridgeEvent::AnalysisDone).await;
+                }
+                Ok(Err(msg)) => { let _ = tx.send(BridgeEvent::AnalysisError(msg)).await; }
+                Err(e)       => { let _ = tx.send(BridgeEvent::AnalysisError(e.to_string())).await; }
+            }
         });
     }
 }
