@@ -86,22 +86,37 @@ fn seed_abi_regs(regs: &mut RegisterTable, next_id: &mut u32) -> HashMap<u32, St
     // Seed list: (canonical 64-bit name, all aliases).
     // We register the canonical name for every id so the codegen can
     // print "rdi" regardless of which alias appeared in the assembly.
-    const ABI_REGS: &[&str] = &[
-        "rdi", "rsi", "rdx", "rcx", "r8", "r9",
-        "rax", "r10", "r11",          // caller-saved
-        "rbx", "r12", "r13", "r14", "r15", // callee-saved
-        "rsp", "rbp",                  // stack / frame
+    // Each tuple: (canonical 64-bit name, list of aliases that map to the same id).
+    // The id is allocated once; every alias points to the same canonical name.
+    const ABI_REGS: &[(&str, &[&str])] = &[
+        ("rdi", &["edi",  "di",  "dil"]),
+        ("rsi", &["esi",  "si",  "sil"]),
+        ("rdx", &["edx",  "dx",  "dl",  "dh"]),
+        ("rcx", &["ecx",  "cx",  "cl",  "ch"]),
+        ("r8",  &["r8d"]),
+        ("r9",  &["r9d"]),
+        ("rax", &["eax",  "ax",  "al",  "ah"]),
+        ("r10", &["r10d"]),
+        ("r11", &["r11d"]),
+        ("rbx", &["ebx",  "bx",  "bl",  "bh"]),
+        ("r12", &["r12d"]),
+        ("r13", &["r13d"]),
+        ("r14", &["r14d"]),
+        ("r15", &["r15d"]),
+        ("rsp", &["esp",  "sp",  "spl"]),
+        ("rbp", &["ebp",  "bp",  "bpl"]),
     ];
 
-    for &reg in ABI_REGS {
-        let ty = if reg == "rsp" || reg == "rbp" {
-            IrType::UInt(64)
-        } else {
-            reg_type(reg)
-        };
+    for &(canon, aliases) in ABI_REGS {
+        let ty = reg_type(canon);
         let (id, _) = fresh(next_id, ty);
-        regs.set(reg, id);
-        names.insert(id, reg.to_string());
+        // Register the canonical name.
+        regs.set(canon, id);
+        names.insert(id, canon.to_string());
+        // Register all aliases to the same id.
+        for &alias in aliases {
+            regs.set(alias, id);
+        }
     }
 
     names
@@ -434,13 +449,9 @@ impl<'a> MemExpr<'a> {
         // Base register, or 0 if absent.
         let mut acc: Value = match self.base {
             Some(r) => {
-                // Prefer the SSA id from the table; if unseen, id=0 is the
-                // "uninitialized" sentinel — emit a warning-free placeholder.
-                let id = regs.get(r).unwrap_or_else(|| {
-                    // Untracked register — use a deterministic id derived
-                    // from the register name so at least the display is stable.
-                    reg_name_to_placeholder_id(r)
-                });
+                let id = regs.get(r)
+                    .or_else(|| { let r64 = to_64bit_name(r); regs.get(&r64) })
+                    .unwrap_or_else(|| reg_name_to_placeholder_id(r));
                 Value::Var { id, ty: IrType::UInt(64) }
             }
             None => Value::Const { val: 0, ty: IrType::UInt(64) },
@@ -448,7 +459,9 @@ impl<'a> MemExpr<'a> {
 
         // index * scale
         if let Some(idx) = self.index {
-            let idx_id = regs.get(idx).unwrap_or_else(|| reg_name_to_placeholder_id(idx));
+            let idx_id = regs.get(idx)
+                .or_else(|| { let r64 = to_64bit_name(idx); regs.get(&r64) })
+                .unwrap_or_else(|| reg_name_to_placeholder_id(idx));
             let idx_val = Value::Var { id: idx_id, ty: IrType::UInt(64) };
 
             let scaled = if self.scale == 1 {
@@ -713,7 +726,11 @@ fn operand_ptr(op: &str, regs: &RegisterTable) -> Value {
 
 fn reg_val(reg: &str, regs: &RegisterTable) -> Value {
     let reg = reg.trim_start_matches('%');
-    let id  = regs.get(reg).unwrap_or_else(|| reg_name_to_placeholder_id(reg));
+    // Try the register as-is first, then fall back to the 64-bit canonical
+    // form so that e.g. `esp` finds the id seeded for `rsp`.
+    let id = regs.get(reg)
+        .or_else(|| { let r64 = to_64bit_name(reg); regs.get(&r64) })
+        .unwrap_or_else(|| reg_name_to_placeholder_id(reg));
     Value::Var { id, ty: reg_type(reg) }
 }
 

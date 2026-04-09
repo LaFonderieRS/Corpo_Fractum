@@ -374,7 +374,14 @@ impl CBackend {
                     .filter_map(|a| {
                         let r = resolve(a, copies);
                         match r {
-                            Value::Const { .. } => Some(display_value(r, copies, slots, reg_names)),
+                            Value::Const { val, .. } => {
+                                // Check if this constant is a string address.
+                                if let Some(text) = self.string_table.get(val) {
+                                    Some(format!("\"{}\"", escape_c_string(text)))
+                                } else {
+                                    Some(display_value(r, copies, slots, reg_names))
+                                }
+                            }
                             Value::Var { id, .. } => {
                                 if written.contains(id) {
                                     Some(display_value(r, copies, slots, reg_names))

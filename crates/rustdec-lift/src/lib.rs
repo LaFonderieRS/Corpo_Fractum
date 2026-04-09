@@ -92,12 +92,28 @@ pub fn lift_function(
 
 // ── String annotation pass ────────────────────────────────────────────────────
 
-/// Walk every stmt in `func` and replace `Value::Const { val: addr }` with
-/// `Expr::StringRef` when `addr` is a known string address.
+/// Walk every stmt in `func` and replace constant addresses with `StringRef`.
 ///
-/// We look specifically at:
-/// - `Stmt::Assign { rhs: Expr::Value(Const(addr)) }` — e.g. `mov rdi, 0x401180`
-/// - `Stmt::Assign { rhs: Expr::Call { args } }` — const args to calls
+/// Two-pass strategy per block:
+///
+/// 1. Build a local copy-table mapping `SSA id → address` for every
+///    `Assign { rhs: Value(Const(addr)) }` in the block.  This lets us
+///    resolve `mov rdi, 0x401180` even when the constant has already been
+///    folded into a Var by the lifter.
+///
+/// 2. Rewrite:
+///    - `Assign { rhs: Expr::Value(Const(addr)) }` → `StringRef`  (direct)
+///    - `Assign { rhs: Expr::Call { args } }` where an arg is `Var(id)` and
+///      `copy_table[id]` is a known string address → replace the arg with a
+///      synthetic `Const(addr)` so the codegen lookup works, and also inject
+///      a `StringRef` wrapper around the call expression where possible.
+///
+/// This handles the common pattern:
+/// ```asm
+/// mov  rdi, 0x401180   ; lifter: vN = 0x401180
+/// call puts            ; lifter: call puts(vN, …)
+/// ```
+/// The copy-table lets us see that `vN == 0x401180` at the call site.
 fn annotate_string_refs(func: &mut IrFunction, strings: &StringTable) {
     use petgraph::visit::NodeIndexable;
     use rustdec_ir::Expr;
@@ -107,53 +123,67 @@ fn annotate_string_refs(func: &mut IrFunction, strings: &StringTable) {
     let node_count = func.cfg.node_count();
     for ni in 0..node_count {
         let idx = func.cfg.from_index(ni);
+
+        // Pass 1 — build block-local const map: id → address.
+        let mut const_map: std::collections::HashMap<u32, u64> =
+            std::collections::HashMap::new();
+        for stmt in &func.cfg[idx].stmts {
+            if let Stmt::Assign { lhs, rhs: Expr::Value(Value::Const { val, .. }), .. } = stmt {
+                const_map.insert(*lhs, *val);
+            }
+        }
+
+        // Pass 2 — rewrite expressions.
         for stmt in &mut func.cfg[idx].stmts {
             match stmt {
-                Stmt::Assign { rhs, .. } => {
-                    annotate_expr(rhs, strings);
-                }
+                Stmt::Assign { rhs, .. } => annotate_expr(rhs, strings, &const_map),
                 _ => {}
             }
         }
     }
 }
 
-fn annotate_expr(expr: &mut rustdec_ir::Expr, strings: &StringTable) {
+fn annotate_expr(
+    expr:      &mut rustdec_ir::Expr,
+    strings:   &StringTable,
+    const_map: &std::collections::HashMap<u32, u64>,
+) {
     use rustdec_ir::Expr;
 
     match expr {
-        // mov reg, <addr>  →  StringRef if addr is a known string.
+        // Direct: `mov reg, <string_addr>` → StringRef.
         Expr::Value(Value::Const { val, .. }) => {
             if let Some(content) = strings.get(val) {
-                trace!(addr = format_args!("{:#x}", val), content = %content, "string ref annotated");
+                trace!(addr = format_args!("{:#x}", val),
+                       content = %content, "string ref annotated (direct)");
                 *expr = Expr::StringRef { addr: *val, content: content.clone() };
             }
         }
 
-        // Call args — annotate const args that point to strings.
+        // Call: resolve Var args through the block-local copy table.
+        // If an arg Var(id) was assigned from a string address, replace it
+        // with a Const(addr) so the codegen StringRef lookup fires.
         Expr::Call { args, .. } => {
             for arg in args.iter_mut() {
-                if let Value::Const { val, .. } = arg {
-                    if let Some(content) = strings.get(val) {
-                        // We can't replace a Value with an Expr here, but we
-                        // can mark the arg with a special sentinel type so the
-                        // codegen can look it up.  Instead, we store the info
-                        // in the surrounding Assign's rhs — the codegen's
-                        // emit_expr_resolved already handles StringRef at the
-                        // top level; for call args we emit them inline below.
-                        // For now the annotation is best-effort: the codegen
-                        // will see Const(addr) and can look up the string table
-                        // itself via the StringRef lookup path.
-                        trace!(addr = format_args!("{:#x}", val),
-                               content = %content,
-                               "call arg points to string");
+                let resolved_addr = match arg {
+                    Value::Const { val, .. } => Some(*val),
+                    Value::Var   { id, .. }  => const_map.get(id).copied(),
+                };
+                if let Some(addr) = resolved_addr {
+                    if strings.contains_key(&addr) {
+                        // Replace with a Const pointing to the string so that
+                        // emit_expr_resolved will see it as a StringRef when
+                        // it evaluates Value::Const against string_table.
+                        *arg = Value::Const { val: addr, ty: rustdec_ir::IrType::Ptr(
+                            Box::new(rustdec_ir::IrType::UInt(8))
+                        )};
+                        trace!(addr = format_args!("{:#x}", addr),
+                               "call arg resolved to string addr");
                     }
                 }
             }
         }
 
-        // LEA result — the addr is in the Opaque string, not a Const.
-        // String resolution for LEA is done in the codegen via address lookup.
         _ => {}
     }
 }
