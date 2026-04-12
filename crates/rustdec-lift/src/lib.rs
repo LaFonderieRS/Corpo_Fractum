@@ -94,26 +94,27 @@ pub fn lift_function(
 
 /// Walk every stmt in `func` and replace constant addresses with `StringRef`.
 ///
-/// Two-pass strategy per block:
+/// Two-pass strategy over the whole function:
 ///
-/// 1. Build a local copy-table mapping `SSA id → address` for every
-///    `Assign { rhs: Value(Const(addr)) }` in the block.  This lets us
-///    resolve `mov rdi, 0x401180` even when the constant has already been
-///    folded into a Var by the lifter.
+/// 1. Build a **function-wide** copy-table mapping `SSA id → address` for every
+///    `Assign { rhs: Value(Const(addr)) }` across all blocks.  Because SSA
+///    guarantees each lhs is unique across the function there are no cross-block
+///    collisions, so the single map covers constants defined in any block that
+///    are used in calls in a different block.
 ///
 /// 2. Rewrite:
 ///    - `Assign { rhs: Expr::Value(Const(addr)) }` → `StringRef`  (direct)
 ///    - `Assign { rhs: Expr::Call { args } }` where an arg is `Var(id)` and
-///      `copy_table[id]` is a known string address → replace the arg with a
-///      synthetic `Const(addr)` so the codegen lookup works, and also inject
-///      a `StringRef` wrapper around the call expression where possible.
+///      `const_map[id]` is a known string address → replace the arg with a
+///      synthetic `Const(addr)` so the codegen lookup works.
 ///
 /// This handles the common pattern:
 /// ```asm
 /// mov  rdi, 0x401180   ; lifter: vN = 0x401180
 /// call puts            ; lifter: call puts(vN, …)
 /// ```
-/// The copy-table lets us see that `vN == 0x401180` at the call site.
+/// The copy-table lets us see that `vN == 0x401180` at the call site even when
+/// the assignment and the call live in separate basic blocks.
 fn annotate_string_refs(func: &mut IrFunction, strings: &StringTable) {
     use petgraph::visit::NodeIndexable;
     use rustdec_ir::Expr;
@@ -121,23 +122,25 @@ fn annotate_string_refs(func: &mut IrFunction, strings: &StringTable) {
     if strings.is_empty() { return; }
 
     let node_count = func.cfg.node_count();
+
+    // Pass 1 — build function-wide const map: SSA id → address.
+    let mut const_map: std::collections::HashMap<u32, u64> =
+        std::collections::HashMap::new();
     for ni in 0..node_count {
         let idx = func.cfg.from_index(ni);
-
-        // Pass 1 — build block-local const map: id → address.
-        let mut const_map: std::collections::HashMap<u32, u64> =
-            std::collections::HashMap::new();
         for stmt in &func.cfg[idx].stmts {
             if let Stmt::Assign { lhs, rhs: Expr::Value(Value::Const { val, .. }), .. } = stmt {
                 const_map.insert(*lhs, *val);
             }
         }
+    }
 
-        // Pass 2 — rewrite expressions.
+    // Pass 2 — rewrite expressions using the global const map.
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
         for stmt in &mut func.cfg[idx].stmts {
-            match stmt {
-                Stmt::Assign { rhs, .. } => annotate_expr(rhs, strings, &const_map),
-                _ => {}
+            if let Stmt::Assign { rhs, .. } = stmt {
+                annotate_expr(rhs, strings, &const_map);
             }
         }
     }
