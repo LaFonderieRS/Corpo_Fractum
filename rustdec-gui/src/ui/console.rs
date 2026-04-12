@@ -82,6 +82,7 @@ impl ConsolePanel {
                         "error",
                         format!("[error] {msg}"),
                     ),
+                    _ => return,
                 };
                 append_line(&buf, &view, severity, &msg);
             });

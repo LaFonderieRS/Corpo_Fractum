@@ -52,7 +52,7 @@ pub fn activate(app: &Application, rt: Handle, log_rx: async_channel::Receiver<L
             BridgeEvent::AnalysisDone | BridgeEvent::AnalysisError(_) => {
                 splash.dismiss();
             }
-            BridgeEvent::AnalysisFunctionReady(_, _) => {}
+            _ => {}
         });
     }
 

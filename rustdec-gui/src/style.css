@@ -14,6 +14,75 @@ window, .background {
     border-bottom: 1px solid #313244;
 }
 
+/* ── Explorer: group headers ─────────────────────────────────────────────── */
+
+.explorer-group-header {
+    background-color: #181825;
+    color: #6c7086;
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 1px;
+    padding: 5px 10px 4px;
+    border-bottom: 1px solid #313244;
+}
+
+.explorer-separator {
+    margin: 0;
+    min-height: 1px;
+    background-color: #313244;
+}
+
+/* ── Explorer: section rows ──────────────────────────────────────────────── */
+
+.section-row {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    margin: 0;
+    box-shadow: none;
+}
+
+.section-row:hover {
+    background-color: #2a2a3e;
+}
+
+.section-row:active {
+    background-color: #313244;
+}
+
+.section-name {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 12px;
+    color: #cdd6f4;
+}
+
+.section-size {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 11px;
+    color: #585b70;
+}
+
+/* ── Section kind badges ─────────────────────────────────────────────────── */
+
+.section-badge {
+    font-size: 9px;
+    font-weight: bold;
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    padding: 1px 5px;
+    border-radius: 3px;
+    min-width: 40px;
+}
+
+.badge-code   { background-color: #1e3a5f; color: #89b4fa; }
+.badge-rodata { background-color: #1a3d2b; color: #a6e3a1; }
+.badge-data   { background-color: #3d2e0a; color: #f9e2af; }
+.badge-bss    { background-color: #2e2e3e; color: #9399b2; }
+.badge-debug  { background-color: #2d1f3e; color: #cba6f7; }
+.badge-other  { background-color: #2e2e2e; color: #6c7086; }
+
+/* ── Function list ───────────────────────────────────────────────────────── */
+
 .function-list row {
     padding: 2px 0;
     border-radius: 4px;

@@ -1,10 +1,13 @@
 //! Central code panel.
 //!
-//! Displays the pseudo-code output from the selected backend.
-//! Uses a [`gtk4::TextView`] in read-only mode with monospaced font and
-//! syntax-highlight placeholders via Pango tags.
+//! Displays either:
+//!  • Decompiled pseudo-code for a selected function (with syntax highlighting)
+//!  • A hex-dump / string-extraction view for a selected binary section
+//!
+//! Content is driven by `FunctionSelected` and `SectionSelected` bridge events.
 
 use std::cell::Cell;
+use std::fmt::Write as FmtWrite;
 use std::rc::Rc;
 
 use glib;
@@ -14,7 +17,9 @@ use gtk4::{
     TextBuffer, TextView, Widget, WrapMode,
 };
 
-use crate::bridge::{AnalysisBridge, BridgeEvent};
+use rustdec_loader::SectionKind;
+
+use crate::bridge::{AnalysisBridge, BridgeEvent, SectionMeta};
 
 // ── Welcome screen ────────────────────────────────────────────────────────────
 
@@ -37,8 +42,9 @@ const WELCOME: &str = "
 > ready.
 ";
 
+const ANALYSIS_DONE_MSG: &str = "// Analysis complete.\n//\n// Select a function or section from the left panel.";
+
 // How many lines to highlight per idle tick.
-// 250 lines ≈ 2–4 ms on a modern CPU, well under the 16 ms GTK frame budget.
 const LINES_PER_TICK: i32 = 250;
 
 const KEYWORDS: &[&str] = &[
@@ -50,8 +56,7 @@ const KEYWORDS: &[&str] = &[
 // ── Panel ─────────────────────────────────────────────────────────────────────
 
 pub struct CodePanel {
-    root:   GtkBox,
-    buffer: TextBuffer,
+    root: GtkBox,
 }
 
 impl CodePanel {
@@ -63,10 +68,6 @@ impl CodePanel {
         root.append(&header);
 
         let buffer = TextBuffer::new(None);
-
-        // Disable the undo history — this is a read-only view that can receive
-        // tens of thousands of lines. Storing every insertion wastes RAM and
-        // slows down GTK's internal bookkeeping unnecessarily.
         buffer.begin_irreversible_action();
         buffer.set_text(WELCOME);
         buffer.end_irreversible_action();
@@ -77,6 +78,12 @@ impl CodePanel {
         if let Some(tag) = buffer.create_tag(Some("keyword"), &[]) {
             tag.set_foreground(Some("#569cd6"));
             tag.set_weight(700);
+        }
+        if let Some(tag) = buffer.create_tag(Some("hex-addr"), &[]) {
+            tag.set_foreground(Some("#9cdcfe"));
+        }
+        if let Some(tag) = buffer.create_tag(Some("hex-ascii"), &[]) {
+            tag.set_foreground(Some("#ce9178"));
         }
 
         let view = TextView::with_buffer(&buffer);
@@ -98,60 +105,69 @@ impl CodePanel {
         root.append(&scroll);
 
         {
-            let buf            = buffer.clone();
-            let is_first       = Rc::new(Cell::new(true));
-            // Guard against duplicate AnalysisDone events launching two
-            // concurrent highlighting passes on the same buffer.
-            let highlighting   = Rc::new(Cell::new(false));
+            let buf          = buffer.clone();
+            let highlighting = Rc::new(Cell::new(false));
 
             bridge.subscribe(move |event| match event {
+                // New binary loading — reset to placeholder.
                 BridgeEvent::AnalysisStarted(_) => {
+                    highlighting.set(false);
                     buf.begin_irreversible_action();
                     buf.set_text("// Analysing binary…");
                     buf.end_irreversible_action();
-                    is_first.set(true);
-                    highlighting.set(false);
                 }
 
-                BridgeEvent::AnalysisFunctionReady(_, code) => {
-                    buf.begin_irreversible_action();
-                    if is_first.get() {
-                        buf.set_text(&code);
-                        is_first.set(false);
-                    } else {
-                        // Two separate inserts avoid a temporary allocation
-                        // that format!("\n\n{code}") would create.
-                        let mut end = buf.end_iter();
-                        buf.insert(&mut end, "\n\n");
-                        let mut end = buf.end_iter();
-                        buf.insert(&mut end, &code);
-                    }
-                    buf.end_irreversible_action();
-                }
-
+                // Analysis done — prompt user to select something if we haven't
+                // replaced the placeholder text with real content yet.
                 BridgeEvent::AnalysisDone => {
-                    // Only start one highlighting pass at a time.
-                    if !highlighting.get() {
-                        highlighting.set(true);
-                        let highlighting = highlighting.clone();
-                        schedule_highlighting(buf.clone(), move || {
-                            highlighting.set(false);
-                        });
+                    let current = buf.text(&buf.start_iter(), &buf.end_iter(), false);
+                    if current.starts_with("// Analysing") {
+                        buf.begin_irreversible_action();
+                        buf.set_text(ANALYSIS_DONE_MSG);
+                        buf.end_irreversible_action();
+                    }
+                }
+
+                // User selected a function — show its decompiled code.
+                BridgeEvent::FunctionSelected(_, code) => {
+                    highlighting.set(false);
+                    buf.begin_irreversible_action();
+                    buf.set_text(&code);
+                    buf.end_irreversible_action();
+
+                    let hl = highlighting.clone();
+                    hl.set(true);
+                    schedule_highlighting(buf.clone(), move || { hl.set(false); });
+                }
+
+                // User selected a binary section — show its content.
+                BridgeEvent::SectionSelected(meta) => {
+                    highlighting.set(false);
+                    let text = format_section_content(&meta);
+                    buf.begin_irreversible_action();
+                    buf.set_text(&text);
+                    buf.end_irreversible_action();
+                    // Only highlight if it's a code section (decompiled view).
+                    // Hex-dump views don't need keyword highlighting.
+                    if meta.kind == SectionKind::Code {
+                        let hl = highlighting.clone();
+                        hl.set(true);
+                        schedule_highlighting(buf.clone(), move || { hl.set(false); });
                     }
                 }
 
                 BridgeEvent::AnalysisError(msg) => {
+                    highlighting.set(false);
                     buf.begin_irreversible_action();
                     buf.set_text(&format!("// Error: {msg}"));
                     buf.end_irreversible_action();
-                    // Reset so the next successful analysis starts cleanly.
-                    is_first.set(true);
-                    highlighting.set(false);
                 }
+
+                _ => {}
             });
         }
 
-        Self { root, buffer }
+        Self { root }
     }
 
     pub fn widget(&self) -> &impl IsA<Widget> {
@@ -159,37 +175,117 @@ impl CodePanel {
     }
 }
 
+// ── Section content formatting ────────────────────────────────────────────────
+
+fn format_section_content(meta: &SectionMeta) -> String {
+    let mut out = String::new();
+
+    let kind_str = match meta.kind {
+        SectionKind::Code         => "executable code",
+        SectionKind::ReadOnlyData => "read-only data",
+        SectionKind::Data         => "initialized data",
+        SectionKind::Bss          => "uninitialized data (BSS)",
+        SectionKind::Debug        => "debug information",
+        SectionKind::Other        => "other",
+    };
+
+    let _ = writeln!(out, "// Section:  {}", meta.name);
+    let _ = writeln!(out, "// Type:     {}", kind_str);
+    let _ = writeln!(out, "// Address:  {:#010x}", meta.virtual_addr);
+    let _ = writeln!(out, "// Size:     {} bytes", meta.size);
+
+    match meta.kind {
+        SectionKind::Code => {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "// This is a code section.");
+            let _ = writeln!(out, "// Select a function from the left panel to view decompiled code.");
+        }
+
+        SectionKind::Bss => {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "// BSS section — zero-initialised at runtime, no raw bytes.");
+        }
+
+        _ => {
+            // Extract printable strings.
+            let strings = extract_printable_strings(&meta.data);
+            if !strings.is_empty() {
+                let _ = writeln!(out);
+                let _ = writeln!(out, "// ── Strings ─────────────────────────────────────────────────────────────");
+                for (offset, s) in strings.iter().take(200) {
+                    let addr = meta.virtual_addr.saturating_add(*offset as u64);
+                    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                    let _ = writeln!(out, "//   {:#010x}  \"{escaped}\"", addr);
+                }
+                if strings.len() > 200 {
+                    let _ = writeln!(out, "//   … ({} more)", strings.len() - 200);
+                }
+            }
+
+            // Hex dump (capped at 4 096 bytes to stay responsive).
+            let _ = writeln!(out);
+            let _ = writeln!(out, "// ── Hex dump ────────────────────────────────────────────────────────────");
+            let cap = meta.data.len().min(4096);
+            for (chunk_idx, chunk) in meta.data[..cap].chunks(16).enumerate() {
+                let addr = meta.virtual_addr.saturating_add((chunk_idx * 16) as u64);
+                let hex: String = chunk
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ascii: String = chunk
+                    .iter()
+                    .map(|&b| if b >= 0x20 && b < 0x7f { b as char } else { '.' })
+                    .collect();
+                let _ = writeln!(out, "{addr:#010x}  {hex:<48}  |{ascii}|");
+            }
+            if meta.data.len() > 4096 {
+                let _ = writeln!(out, "// … ({} more bytes not shown)", meta.data.len() - 4096);
+            }
+        }
+    }
+
+    out
+}
+
+/// Extract printable ASCII strings of length ≥ 4 from a byte slice.
+fn extract_printable_strings(data: &[u8]) -> Vec<(usize, String)> {
+    let mut result  = Vec::new();
+    let mut current = String::new();
+    let mut start   = 0usize;
+
+    for (i, &b) in data.iter().enumerate() {
+        if b >= 0x20 && b < 0x7f {
+            if current.is_empty() { start = i; }
+            current.push(b as char);
+        } else {
+            if current.len() >= 4 {
+                result.push((start, std::mem::take(&mut current)));
+            } else {
+                current.clear();
+            }
+        }
+    }
+    if current.len() >= 4 {
+        result.push((start, current));
+    }
+    result
+}
+
 // ── Incremental syntax highlighting ──────────────────────────────────────────
 
-/// Start an incremental highlighting pass on `buf`.
-///
-/// `on_done` is called once every line has been processed.
-/// The pass is split into ticks of `LINES_PER_TICK` lines each, yielding to
-/// the GTK main loop between ticks so the UI stays responsive.
-///
-/// Old tags are cleared before the first tick so that a second analysis never
-/// accumulates stale highlights from the previous run.
 fn schedule_highlighting(buf: TextBuffer, on_done: impl Fn() + 'static) {
     let on_done   = Rc::new(on_done);
     let next_line = Rc::new(Cell::new(0i32));
 
-    // Clear all existing tags before starting — prevents stale highlights
-    // from a previous analysis bleeding into the new one.
     let start = buf.start_iter();
     let end   = buf.end_iter();
     buf.remove_all_tags(&start, &end);
 
-    fn tick(
-        buf:       TextBuffer,
-        next_line: Rc<Cell<i32>>,
-        on_done:   Rc<dyn Fn()>,
-    ) {
+    fn tick(buf: TextBuffer, next_line: Rc<Cell<i32>>, on_done: Rc<dyn Fn()>) {
         let total = buf.line_count();
         let from  = next_line.get();
-        if from >= total {
-            on_done();
-            return;
-        }
+        if from >= total { on_done(); return; }
 
         let to = (from + LINES_PER_TICK).min(total);
         highlight_range(&buf, from, to);
@@ -208,11 +304,6 @@ fn schedule_highlighting(buf: TextBuffer, on_done: impl Fn() + 'static) {
     glib::idle_add_local_once(move || tick(buf, next_line, on_done));
 }
 
-/// Highlight lines `[from, to)` using a single sequential scan per line.
-///
-/// Rather than running 18 separate `find` passes (one per keyword), we scan
-/// the line once and check every byte position against the keyword list —
-/// O(line_len × avg_kw_len) instead of O(line_len × kw_count).
 fn highlight_range(buf: &TextBuffer, from: i32, to: i32) {
     for line_no in from..to {
         let line_start = buf.iter_at_line(line_no)
@@ -220,12 +311,9 @@ fn highlight_range(buf: &TextBuffer, from: i32, to: i32) {
         let mut line_end = line_start.clone();
         line_end.forward_to_line_end();
 
-        // buf.text returns a GString — avoid a second allocation by working
-        // on the GString directly rather than calling .to_string().
         let line_gstr = buf.text(&line_start, &line_end, false);
         let line_text: &str = line_gstr.as_str();
 
-        // Comment: colour from `//` to end of line, skip keyword scan.
         if let Some(col) = line_text.find("//") {
             if let Some(cs) = buf.iter_at_line_offset(line_no, col as i32) {
                 buf.apply_tag_by_name("comment", &cs, &line_end);
@@ -233,26 +321,19 @@ fn highlight_range(buf: &TextBuffer, from: i32, to: i32) {
             continue;
         }
 
-        // Single-pass keyword scan: try each position once.
         let bytes = line_text.as_bytes();
         let len   = bytes.len();
         let mut pos = 0usize;
 
         while pos < len {
-            // Quick pre-filter: skip positions that can't start a word boundary.
             let prev_alpha = pos > 0 && bytes[pos - 1].is_ascii_alphanumeric();
-            if prev_alpha {
-                pos += 1;
-                continue;
-            }
+            if prev_alpha { pos += 1; continue; }
 
-            // Try every keyword at this position.
             let mut matched = false;
             for kw in KEYWORDS {
                 let kw_len = kw.len();
                 if pos + kw_len > len { continue; }
                 if &line_text[pos..pos + kw_len] != *kw { continue; }
-                // Check trailing boundary.
                 let after_ok = pos + kw_len >= len
                     || !bytes[pos + kw_len].is_ascii_alphanumeric();
                 if after_ok {
@@ -267,7 +348,6 @@ fn highlight_range(buf: &TextBuffer, from: i32, to: i32) {
                     break;
                 }
             }
-
             if !matched { pos += 1; }
         }
     }

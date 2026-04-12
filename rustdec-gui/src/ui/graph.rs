@@ -89,6 +89,7 @@ impl GraphPanel {
                     canvas.queue_draw();
                 }
                 BridgeEvent::AnalysisError(_) => {}
+                _ => {}
             });
         }
 
