@@ -23,7 +23,7 @@ use std::sync::Arc;
 use glib::MainContext;
 use tokio::runtime::Handle;
 
-use rustdec_analysis::analyse;
+use rustdec_analysis::{analyse, build_call_graph};
 use rustdec_codegen::{emit_module, Language};
 use rustdec_ir::{CallTarget, Expr, IrModule, Stmt};
 use rustdec_loader::{load_file, SectionKind};
@@ -266,83 +266,91 @@ impl AnalysisBridge {
 
 // ── Call-graph extraction ─────────────────────────────────────────────────────
 
-/// Walk the `IrModule` and build a complete `CallGraphData`.
+/// Build a [`CallGraphData`] from `module` for the graph panel.
 ///
-/// This runs on the Tokio blocking thread, so it may take a little time on
-/// large binaries, but it only runs once per file load.
+/// # Two-phase approach
+///
+/// 1. **Adjacency** — delegated to [`rustdec_analysis::build_call_graph`],
+///    which owns the canonical definition of "what is a call edge".
+///    This gives us the deduplicated `caller → [callees]` map.
+///
+/// 2. **Site counts** — a single additional pass counts how many distinct
+///    `call` instructions contribute each edge (e.g. if `foo` calls `bar`
+///    from three different basic blocks, `sites = 3`).  This weight is used
+///    by the graph panel to vary edge opacity.
+///
+/// Only the bridge needs `CallGraphData`; the richer per-node metadata
+/// (block count, statement count) is not part of the analysis-crate API.
 fn extract_call_graph(module: &IrModule) -> CallGraphData {
-    // ── 1. Index all internal functions ──────────────────────────────────────
-    //
-    // We build two lookup maps:
-    //   * name  → function index  (for `CallTarget::Named`)
-    //   * addr  → function index  (for `CallTarget::Direct`)
+    // ── 1. Function metadata + index maps ────────────────────────────────────
     let mut functions: Vec<CgFunction> = Vec::with_capacity(module.functions.len());
     let mut name_to_idx: HashMap<String, usize> = HashMap::new();
     let mut addr_to_idx: HashMap<u64, usize>    = HashMap::new();
 
     for func in &module.functions {
-        let idx = functions.len();
+        let idx    = functions.len();
         let blocks = func.blocks_sorted();
-        let stmt_count = blocks.iter().map(|b| b.stmts.len()).sum();
-
         functions.push(CgFunction {
             name:        func.name.clone(),
             entry_addr:  func.entry_addr,
             block_count: blocks.len(),
-            stmt_count,
+            stmt_count:  blocks.iter().map(|b| b.stmts.len()).sum(),
         });
-
         name_to_idx.insert(func.name.clone(), idx);
         addr_to_idx.insert(func.entry_addr, idx);
     }
 
-    // ── 2. Extract call edges ─────────────────────────────────────────────────
-    //
-    // For each (caller_idx, callee_name) pair, count the number of call sites
-    // (i.e. how many `call` instructions reference this callee in this caller).
-    //
-    // Key: (caller_idx, callee_name_string)
-    // Value: site count
-    let mut edge_map: HashMap<(usize, String), usize> = HashMap::new();
+    // ── 2. Adjacency from the analysis crate ─────────────────────────────────
+    // `build_call_graph` owns the canonical edge-extraction logic and handles
+    // deduplication + deterministic sorting for us.
+    let adjacency = build_call_graph(module);
 
-    for (caller_idx, func) in module.functions.iter().enumerate() {
+    // ── 3. Call-site counts ───────────────────────────────────────────────────
+    // Walk the IR once more to count raw call-instruction occurrences per
+    // (caller_idx, callee_name) pair.  This is the only information that
+    // `build_call_graph` intentionally discards (it deduplicates).
+    let mut site_map: HashMap<(usize, String), usize> = HashMap::new();
+
+    for func in &module.functions {
+        let Some(&caller_idx) = name_to_idx.get(&func.name) else { continue };
+
         for block in func.blocks_sorted() {
             for stmt in &block.stmts {
                 let callee_name = match stmt {
-                    Stmt::Assign {
-                        rhs: Expr::Call { target, .. },
-                        ..
-                    } => match target {
-                        CallTarget::Direct(addr) => {
-                            addr_to_idx.get(addr)
-                                .map(|&i| functions[i].name.clone())
-                        }
-                        CallTarget::Named(name) => Some(name.clone()),
-                        // Indirect calls (function pointers) — we can't
-                        // resolve the target statically.
+                    Stmt::Assign { rhs: Expr::Call { target, .. }, .. } => match target {
+                        CallTarget::Named(n)   => Some(n.clone()),
+                        CallTarget::Direct(a)  => addr_to_idx
+                            .get(a)
+                            .map(|&i| functions[i].name.clone()),
                         CallTarget::Indirect(_) => None,
                     },
                     _ => None,
                 };
 
                 if let Some(name) = callee_name {
-                    // Self-recursion: keep it — it is a real edge.
-                    *edge_map.entry((caller_idx, name)).or_insert(0) += 1;
+                    *site_map.entry((caller_idx, name)).or_insert(0) += 1;
                 }
             }
         }
     }
 
-    // ── 3. Flatten edge map into CgEdge list ──────────────────────────────────
-    let mut edges: Vec<CgEdge> = edge_map
-        .into_iter()
-        .map(|((caller_idx, callee_name), sites)| {
-            let callee_idx = name_to_idx.get(&callee_name).copied();
-            CgEdge { caller_idx, callee_idx, callee_name, sites }
-        })
-        .collect();
+    // ── 4. Assemble CgEdge list from adjacency + site counts ─────────────────
+    let mut edges: Vec<CgEdge> = Vec::new();
 
-    // Sort for deterministic output (stable layout across runs).
+    for (caller_name, callees) in adjacency.iter() {
+        let Some(&caller_idx) = name_to_idx.get(caller_name) else { continue };
+
+        for callee_name in callees {
+            let callee_idx = name_to_idx.get(callee_name).copied();
+            let sites = site_map
+                .get(&(caller_idx, callee_name.clone()))
+                .copied()
+                .unwrap_or(1);
+
+            edges.push(CgEdge { caller_idx, callee_idx, callee_name: callee_name.clone(), sites });
+        }
+    }
+
     edges.sort_by(|a, b| {
         a.caller_idx
             .cmp(&b.caller_idx)
