@@ -1,13 +1,15 @@
-//! String table — scans binary sections for null-terminated ASCII/UTF-8 strings.
+//! String table — scans binary sections for null-terminated ASCII/UTF-8 strings
+//! and UTF-16 LE strings (Windows PE wide strings).
 //!
 //! ## What counts as a string
 //!
-//! We extract any sequence of printable bytes (0x20–0x7e) plus common
-//! escape characters (`\t`, `\n`, `\r`) that is terminated by a null byte
-//! and has a minimum length of 4 printable characters.
+//! **ASCII / UTF-8** — any sequence of printable bytes (0x20–0x7e) plus common
+//! escape characters (`\t`, `\n`, `\r`) that is terminated by a null byte and
+//! has a minimum length of 4 printable characters.
 //!
-//! This covers the vast majority of C string literals while avoiding false
-//! positives from binary data blobs.
+//! **UTF-16 LE** — sequences of `(printable_byte, 0x00)` pairs terminated by
+//! `0x00 0x00`, minimum 4 printable characters.  Common in Windows PE binaries
+//! where string literals are stored as wide strings (`wchar_t*`).
 //!
 //! ## Sections scanned
 //!
@@ -33,6 +35,7 @@ pub fn extract_strings(obj: &BinaryObject) -> StringTable {
     }) {
         let count_before = table.len();
         scan_section(section.virtual_addr, &section.data, &mut table);
+        scan_utf16_le(section.virtual_addr, &section.data, &mut table);
         let found = table.len() - count_before;
         if found > 0 {
             debug!(section = %section.name,
@@ -46,46 +49,96 @@ pub fn extract_strings(obj: &BinaryObject) -> StringTable {
     table
 }
 
+/// Scan `data` for null-terminated ASCII strings, inserting each into `out`.
+///
+/// Single-pass flat loop: `start` and `buf` are reset explicitly on every
+/// non-printable byte so that the next candidate begins immediately after the
+/// bad byte without re-entering the outer loop.
 fn scan_section(base_va: u64, data: &[u8], out: &mut StringTable) {
-    let mut i = 0;
-    while i < data.len() {
-        // Try to start a string at position i.
-        let start = i;
-        let mut printable = 0usize;
-        let mut buf = String::new();
+    let mut i         = 0usize;
+    let mut start     = 0usize;
+    let mut buf       = String::new();
+    let mut printable = 0usize;
 
-        while i < data.len() {
-            let b = data[i];
-            match b {
-                0 => {
-                    // Null terminator — end of candidate string.
-                    i += 1;
-                    break;
+    while i < data.len() {
+        match data[i] {
+            0 => {
+                // Null terminator — emit candidate if long enough.
+                if printable >= 4 {
+                    let va = base_va + start as u64;
+                    trace!(va = format_args!("{:#x}", va), content = %buf, "string found");
+                    out.insert(va, buf.clone());
                 }
-                b'\t' | b'\n' | b'\r' => {
-                    buf.push(b as char);
-                    i += 1;
-                }
-                0x20..=0x7e => {
-                    buf.push(b as char);
-                    printable += 1;
-                    i += 1;
-                }
-                _ => {
-                    // Non-printable byte — not a string.
-                    i += 1;
-                    buf.clear();
-                    printable = 0;
-                    break;
-                }
+                buf.clear();
+                printable = 0;
+                i += 1;
+                start = i;
+            }
+            b'\t' | b'\n' | b'\r' => {
+                buf.push(data[i] as char);
+                i += 1;
+            }
+            0x20..=0x7e => {
+                buf.push(data[i] as char);
+                printable += 1;
+                i += 1;
+            }
+            _ => {
+                // Non-printable — discard current candidate and start fresh
+                // from the position immediately after this byte.
+                buf.clear();
+                printable = 0;
+                i += 1;
+                start = i;
             }
         }
+    }
+}
 
-        // Accept strings with at least 4 printable characters.
-        if printable >= 4 && !buf.is_empty() {
-            let va = base_va + start as u64;
-            trace!(va = format_args!("{:#x}", va), content = %buf, "string found");
-            out.insert(va, buf);
+/// Scan `data` for null-terminated UTF-16 LE strings (Windows PE wide strings).
+///
+/// A valid wide character in the ASCII range is a `(lo, 0x00)` pair where `lo`
+/// is a printable byte.  Strings are terminated by `(0x00, 0x00)`.  If a
+/// virtual address already has an ASCII entry the wide entry is silently
+/// dropped so the ASCII version takes precedence.
+fn scan_utf16_le(base_va: u64, data: &[u8], out: &mut StringTable) {
+    let mut i         = 0usize;
+    let mut start     = 0usize;
+    let mut buf       = String::new();
+    let mut printable = 0usize;
+
+    while i + 1 < data.len() {
+        let lo = data[i];
+        let hi = data[i + 1];
+
+        if lo == 0 && hi == 0 {
+            // Wide null terminator — emit candidate.
+            if printable >= 4 {
+                let va = base_va + start as u64;
+                trace!(va = format_args!("{:#x}", va), content = %buf, "utf16le string found");
+                out.entry(va).or_insert_with(|| buf.clone());
+            }
+            buf.clear();
+            printable = 0;
+            i += 2;
+            start = i;
+        } else if hi == 0 && is_wide_printable(lo) {
+            // Printable BMP character in ASCII range.
+            buf.push(lo as char);
+            if lo >= 0x20 { printable += 1; }
+            i += 2;
+        } else {
+            // Not a valid wide char pair — discard candidate and advance by
+            // one byte so we try every possible alignment.
+            buf.clear();
+            printable = 0;
+            i += 1;
+            start = i;
         }
     }
+}
+
+#[inline]
+fn is_wide_printable(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7e)
 }
