@@ -33,14 +33,26 @@
 //! * External / imported symbols — dark-teal nodes, fixed height.
 //! * Edges — cubic Bézier, opacity proportional to `sites`.
 //! * Arrowheads — small filled triangle at the callee end.
+//!
+//! # Interactivity
+//!
+//! * **Click** a node to select it and emit `FunctionSelected` via the bridge.
+//! * **Drag** (left-button) to pan the canvas.
+//! * **Scroll wheel** to zoom in/out, pivoting around the pointer.
+//! * **Hover** highlights the node and colours its incoming/outgoing edges.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use glib::Propagation;
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, DrawingArea, Label, Orientation, ScrolledWindow, Widget};
+use gtk4::{
+    Box as GtkBox, DrawingArea, EventControllerMotion, EventControllerScroll,
+    EventControllerScrollFlags, GestureClick, GestureDrag, Label, Orientation,
+    ScrolledWindow, Widget,
+};
 
 use crate::bridge::{AnalysisBridge, BridgeEvent, CallGraphData};
 
@@ -57,6 +69,17 @@ const V_GAP:        f64 = 70.0;
 const PAD:          f64 = 32.0;
 const ARROW_SIZE:   f64 = 8.0;
 const MAX_LABEL:    usize = 23;
+
+// ── Edge highlight style ──────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum EdgeHighlight {
+    None,
+    /// Edge leaves the hovered node (caller → callee).
+    Outgoing,
+    /// Edge enters the hovered node (caller → callee).
+    Incoming,
+}
 
 // ── Internal graph representation ────────────────────────────────────────────
 
@@ -80,12 +103,46 @@ struct LayoutEdge {
     sites:      usize,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct GraphState {
     nodes:    Vec<LayoutNode>,
     edges:    Vec<LayoutEdge>,
     canvas_w: f64,
     canvas_h: f64,
+    // ── View transform ────────────────────────────────────────────────────────
+    offset_x: f64,
+    offset_y: f64,
+    scale:    f64,
+    // ── Drag-pan tracking ────────────────────────────────────────────────────
+    /// Offset snapshot captured at drag_begin, used to compute absolute pan.
+    pan_base_x: f64,
+    pan_base_y: f64,
+    // ── Interaction ──────────────────────────────────────────────────────────
+    selected: Option<usize>,
+    hovered:  Option<usize>,
+    /// Most recent pointer position in widget coordinates (used for zoom pivot).
+    mouse_x:  f64,
+    mouse_y:  f64,
+}
+
+impl Default for GraphState {
+    fn default() -> Self {
+        Self {
+            nodes:      Vec::new(),
+            edges:      Vec::new(),
+            canvas_w:   0.0,
+            canvas_h:   0.0,
+            offset_x:   0.0,
+            offset_y:   0.0,
+            scale:      1.0,
+            pan_base_x: 0.0,
+            pan_base_y: 0.0,
+            selected:   None,
+            hovered:    None,
+            mouse_x:    0.0,
+            mouse_y:    0.0,
+        }
+    }
 }
 
 // ── Panel ─────────────────────────────────────────────────────────────────────
@@ -116,6 +173,105 @@ impl GraphPanel {
                 let s = state.borrow();
                 render(&s, cr);
             });
+        }
+
+        // ── Click: select node and emit bridge event ──────────────────────────
+        {
+            let state      = state.clone();
+            let canvas_cb  = canvas.clone();
+            let bridge     = bridge.clone();
+            let click      = GestureClick::new();
+            click.connect_pressed(move |_gesture, _n_press, x, y| {
+                let idx = hit_test(&state.borrow(), x, y);
+                if let Some(i) = idx {
+                    let full_name = state.borrow().nodes[i].full_name.clone();
+                    state.borrow_mut().selected = Some(i);
+                    canvas_cb.queue_draw();
+                    bridge.select_function(&full_name);
+                } else {
+                    state.borrow_mut().selected = None;
+                    canvas_cb.queue_draw();
+                }
+            });
+            canvas.add_controller(click);
+        }
+
+        // ── Drag: pan the canvas ──────────────────────────────────────────────
+        {
+            let state  = state.clone();
+            let canvas = canvas.clone();
+            let drag   = GestureDrag::new();
+            {
+                let state = state.clone();
+                drag.connect_drag_begin(move |_gesture, _x, _y| {
+                    let mut s  = state.borrow_mut();
+                    s.pan_base_x = s.offset_x;
+                    s.pan_base_y = s.offset_y;
+                });
+            }
+            {
+                let state  = state.clone();
+                let canvas = canvas.clone();
+                drag.connect_drag_update(move |_gesture, dx, dy| {
+                    {
+                        let mut s  = state.borrow_mut();
+                        s.offset_x = s.pan_base_x + dx;
+                        s.offset_y = s.pan_base_y + dy;
+                    }
+                    canvas.queue_draw();
+                });
+            }
+            canvas.add_controller(drag);
+        }
+
+        // ── Scroll: zoom around the pointer ──────────────────────────────────
+        {
+            let state     = state.clone();
+            let canvas_cb = canvas.clone();
+            let scroll    = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+            scroll.connect_scroll(move |_ctrl, _dx, dy| {
+                let (mx, my, old_scale, old_ox, old_oy) = {
+                    let s = state.borrow();
+                    (s.mouse_x, s.mouse_y, s.scale, s.offset_x, s.offset_y)
+                };
+                // dy < 0 means scroll up (zoom in).
+                let factor    = if dy < 0.0 { 1.1 } else { 1.0 / 1.1 };
+                let new_scale = (old_scale * factor).clamp(0.1, 8.0);
+                // Keep the canvas point under the pointer fixed after zoom.
+                let cx = (mx - old_ox) / old_scale;
+                let cy = (my - old_oy) / old_scale;
+                {
+                    let mut s  = state.borrow_mut();
+                    s.scale    = new_scale;
+                    s.offset_x = mx - cx * new_scale;
+                    s.offset_y = my - cy * new_scale;
+                }
+                canvas_cb.queue_draw();
+                Propagation::Proceed
+            });
+            canvas.add_controller(scroll);
+        }
+
+        // ── Motion: hover detection ───────────────────────────────────────────
+        {
+            let state     = state.clone();
+            let canvas_cb = canvas.clone();
+            let motion    = EventControllerMotion::new();
+            motion.connect_motion(move |_ctrl, x, y| {
+                let new_hovered = hit_test(&state.borrow(), x, y);
+                let old_hovered = state.borrow().hovered;
+                {
+                    let mut s = state.borrow_mut();
+                    s.mouse_x = x;
+                    s.mouse_y = y;
+                    s.hovered = new_hovered;
+                }
+                // Only redraw when the highlighted node changes.
+                if new_hovered != old_hovered {
+                    canvas_cb.queue_draw();
+                }
+            });
+            canvas.add_controller(motion);
         }
 
         let scroll = ScrolledWindow::builder()
@@ -346,13 +502,25 @@ fn layout(cg: &Arc<CallGraphData>) -> GraphState {
     // Remap edges to LayoutEdge (already using slot indices).
     let edges = layout_edges;
 
-    GraphState { nodes, edges, canvas_w, canvas_h }
+    GraphState { nodes, edges, canvas_w, canvas_h, ..Default::default() }
+}
+
+// ── Hit testing ───────────────────────────────────────────────────────────────
+
+/// Returns the index of the node at widget position `(wx, wy)`, or `None`.
+fn hit_test(state: &GraphState, wx: f64, wy: f64) -> Option<usize> {
+    // Convert widget coordinates to canvas coordinates.
+    let cx = (wx - state.offset_x) / state.scale;
+    let cy = (wy - state.offset_y) / state.scale;
+    state.nodes.iter().position(|n| {
+        cx >= n.x && cx <= n.x + NODE_W && cy >= n.y && cy <= n.y + n.h
+    })
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
 fn render(state: &GraphState, cr: &cairo::Context) {
-    // Background.
+    // Background — painted before the transform so it always fills the widget.
     cr.set_source_rgb(0.118, 0.118, 0.157);
     cr.paint().ok();
 
@@ -366,36 +534,65 @@ fn render(state: &GraphState, cr: &cairo::Context) {
         return;
     }
 
+    // Apply pan + zoom transform.
+    cr.save().ok();
+    cr.translate(state.offset_x, state.offset_y);
+    cr.scale(state.scale, state.scale);
+
     // Edges first (drawn behind nodes).
     let max_sites = state.edges.iter().map(|e| e.sites).max().unwrap_or(1).max(1);
     for edge in &state.edges {
         if edge.from < state.nodes.len() && edge.to < state.nodes.len() {
             let alpha = 0.35 + 0.55 * (edge.sites as f64 / max_sites as f64);
-            draw_edge(cr, &state.nodes[edge.from], &state.nodes[edge.to], alpha);
+            let highlight = match state.hovered {
+                Some(h) if edge.from == h => EdgeHighlight::Outgoing,
+                Some(h) if edge.to   == h => EdgeHighlight::Incoming,
+                _                         => EdgeHighlight::None,
+            };
+            draw_edge(cr, &state.nodes[edge.from], &state.nodes[edge.to], alpha, highlight);
         }
     }
 
     // Nodes on top.
-    for node in &state.nodes {
-        draw_node(cr, node);
+    for (i, node) in state.nodes.iter().enumerate() {
+        let selected = state.selected == Some(i);
+        let hovered  = state.hovered  == Some(i);
+        draw_node(cr, node, selected, hovered);
     }
+
+    cr.restore().ok();
 }
 
-fn draw_node(cr: &cairo::Context, node: &LayoutNode) {
+fn draw_node(cr: &cairo::Context, node: &LayoutNode, selected: bool, hovered: bool) {
     let (x, y, w, h, r) = (node.x, node.y, NODE_W, node.h, 6.0_f64);
-
     rounded_rect(cr, x, y, w, h, r);
 
+    // Fill — slightly brighter on hover.
     if node.is_external {
-        cr.set_source_rgb(0.07, 0.20, 0.22);
+        if hovered {
+            cr.set_source_rgb(0.12, 0.30, 0.33);
+        } else {
+            cr.set_source_rgb(0.07, 0.20, 0.22);
+        }
         cr.fill_preserve().ok();
-        cr.set_source_rgba(0.22, 0.50, 0.54, 0.9);
+        let stroke: (f64, f64, f64) = if selected     { (0.98, 0.82, 0.25) }
+                                      else if hovered  { (0.34, 0.72, 0.78) }
+                                      else             { (0.22, 0.50, 0.54) };
+        cr.set_source_rgba(stroke.0, stroke.1, stroke.2, 0.95);
     } else {
-        cr.set_source_rgb(0.07, 0.18, 0.35);
+        if hovered {
+            cr.set_source_rgb(0.10, 0.26, 0.48);
+        } else {
+            cr.set_source_rgb(0.07, 0.18, 0.35);
+        }
         cr.fill_preserve().ok();
-        cr.set_source_rgba(0.18, 0.43, 0.72, 0.9);
+        let stroke: (f64, f64, f64) = if selected     { (0.98, 0.82, 0.25) }
+                                      else if hovered  { (0.42, 0.68, 1.00) }
+                                      else             { (0.18, 0.43, 0.72) };
+        cr.set_source_rgba(stroke.0, stroke.1, stroke.2, 0.95);
     }
-    cr.set_line_width(1.2);
+
+    cr.set_line_width(if selected || hovered { 2.0 } else { 1.2 });
     cr.stroke().ok();
 
     // Function name.
@@ -409,7 +606,13 @@ fn draw_node(cr: &cairo::Context, node: &LayoutNode) {
     cr.show_text(&node.name).ok();
 }
 
-fn draw_edge(cr: &cairo::Context, from: &LayoutNode, to: &LayoutNode, alpha: f64) {
+fn draw_edge(
+    cr: &cairo::Context,
+    from: &LayoutNode,
+    to: &LayoutNode,
+    alpha: f64,
+    highlight: EdgeHighlight,
+) {
     // Source: bottom-centre of caller.
     let sx = from.x + NODE_W / 2.0;
     let sy = from.y + from.h;
@@ -434,16 +637,27 @@ fn draw_edge(cr: &cairo::Context, from: &LayoutNode, to: &LayoutNode, alpha: f64
         (sx, sy + ctrl_dy, ex, ey - ctrl_dy)
     };
 
-    cr.set_source_rgba(0.32, 0.52, 0.78, alpha);
-    cr.set_line_width(1.4);
+    let (r, g, b, a, lw) = match highlight {
+        EdgeHighlight::Outgoing => (0.34, 0.85, 0.55, (alpha + 0.3).min(1.0), 2.2), // green
+        EdgeHighlight::Incoming => (0.95, 0.62, 0.28, (alpha + 0.3).min(1.0), 2.2), // amber
+        EdgeHighlight::None     => (0.32, 0.52, 0.78, alpha,                   1.4), // blue
+    };
+
+    cr.set_source_rgba(r, g, b, a);
+    cr.set_line_width(lw);
     cr.move_to(sx, sy);
     cr.curve_to(cx1, cy1, cx2, cy2, ex, ey);
     cr.stroke().ok();
 
-    draw_arrowhead(cr, cx2, cy2, ex, ey, alpha);
+    draw_arrowhead(cr, cx2, cy2, ex, ey, r, g, b, (a + 0.1).min(1.0));
 }
 
-fn draw_arrowhead(cr: &cairo::Context, fx: f64, fy: f64, tx: f64, ty: f64, alpha: f64) {
+fn draw_arrowhead(
+    cr: &cairo::Context,
+    fx: f64, fy: f64,
+    tx: f64, ty: f64,
+    r: f64, g: f64, b: f64, a: f64,
+) {
     let angle   = (ty - fy).atan2(tx - fx);
     let spread  = std::f64::consts::PI / 5.5;
     let ax1 = tx - ARROW_SIZE * (angle - spread).cos();
@@ -451,7 +665,7 @@ fn draw_arrowhead(cr: &cairo::Context, fx: f64, fy: f64, tx: f64, ty: f64, alpha
     let ax2 = tx - ARROW_SIZE * (angle + spread).cos();
     let ay2 = ty - ARROW_SIZE * (angle + spread).sin();
 
-    cr.set_source_rgba(0.32, 0.52, 0.78, (alpha + 0.2).min(1.0));
+    cr.set_source_rgba(r, g, b, a);
     cr.move_to(tx, ty);
     cr.line_to(ax1, ay1);
     cr.line_to(ax2, ay2);
