@@ -25,6 +25,7 @@ use tokio::runtime::Handle;
 
 use rustdec_analysis::analyse;
 use rustdec_codegen::{emit_module, Language};
+use rustdec_ir::{CallTarget, Expr, IrModule, Stmt};
 use rustdec_loader::{load_file, SectionKind};
 
 // ── Section metadata ──────────────────────────────────────────────────────────
@@ -43,6 +44,54 @@ pub struct SectionMeta {
     pub data:         Arc<Vec<u8>>,
 }
 
+// ── Call-graph types ──────────────────────────────────────────────────────────
+
+/// One function node in the call graph, extracted from the IR.
+///
+/// All fields are `Send + Clone` so the struct travels through
+/// `async_channel` without issues.
+#[derive(Debug, Clone)]
+pub struct CgFunction {
+    /// Demangled name (may be synthetic like `sub_401000`).
+    pub name:        String,
+    /// Entry virtual address.
+    pub entry_addr:  u64,
+    /// Number of basic blocks in the CFG.
+    pub block_count: usize,
+    /// Total number of IR statements across all blocks.
+    pub stmt_count:  usize,
+}
+
+/// One directed call edge in the call graph.
+#[derive(Debug, Clone)]
+pub struct CgEdge {
+    /// Index into `CallGraphData::functions` for the caller.
+    pub caller_idx: usize,
+    /// Index into `CallGraphData::functions` for the callee.
+    ///
+    /// `None` for calls that could not be resolved to a known internal
+    /// function (e.g. indirect calls, or calls into external libraries
+    /// that are only present as imports).
+    pub callee_idx: Option<usize>,
+    /// Name of the callee, even when `callee_idx` is `None`.
+    pub callee_name: String,
+    /// Number of distinct call-sites from `caller` to `callee_name`.
+    /// Multiple `call` instructions in different basic blocks count separately.
+    pub sites: usize,
+}
+
+/// Complete call-graph snapshot, extracted from the IR before code generation.
+///
+/// This is what the graph panel draws.  It is intentionally a plain-data
+/// description of the graph: no petgraph types, no `IrFunction` references.
+#[derive(Debug, Clone, Default)]
+pub struct CallGraphData {
+    /// All internal functions, in the order they were discovered.
+    pub functions: Vec<CgFunction>,
+    /// All call edges, resolved against `functions`.
+    pub edges:     Vec<CgEdge>,
+}
+
 // ── Events ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -55,6 +104,8 @@ pub enum BridgeEvent {
     /// Emitted after all functions have been streamed — signals completion.
     AnalysisDone,
     AnalysisError(String),
+    /// Full call-graph snapshot, emitted once after `AnalysisDone`.
+    CallGraphReady(Arc<CallGraphData>),
     /// User clicked a function in the explorer — show its decompiled code.
     FunctionSelected(String, String),
     /// User clicked a section in the explorer — show its content.
@@ -84,8 +135,8 @@ pub struct AnalysisBridge {
 impl AnalysisBridge {
     pub fn new(rt: Handle) -> Self {
         let (tx, rx) = async_channel::unbounded::<BridgeEvent>();
-        let listeners:    Rc<RefCell<Vec<Callback>>>             = Rc::new(RefCell::new(vec![]));
-        let function_map: Rc<RefCell<HashMap<String, String>>>   = Rc::new(RefCell::new(HashMap::new()));
+        let listeners:    Rc<RefCell<Vec<Callback>>>                = Rc::new(RefCell::new(vec![]));
+        let function_map: Rc<RefCell<HashMap<String, String>>>      = Rc::new(RefCell::new(HashMap::new()));
         let section_map:  Rc<RefCell<HashMap<String, SectionMeta>>> = Rc::new(RefCell::new(HashMap::new()));
 
         // Drain the channel on the GTK main thread.
@@ -173,7 +224,7 @@ impl AnalysisBridge {
             let result = tokio::task::spawn_blocking(move || {
                 let obj = load_file(&path).map_err(|e| e.to_string())?;
 
-                // Collect section metadata + raw bytes (Arc for cheap event cloning).
+                // Collect section metadata + raw bytes.
                 let sections: Vec<SectionMeta> = obj.sections.iter().map(|s| SectionMeta {
                     name:         s.name.clone(),
                     kind:         s.kind,
@@ -182,25 +233,121 @@ impl AnalysisBridge {
                     data:         Arc::new(s.data.clone()),
                 }).collect();
 
-                let module = analyse(&obj).map_err(|e| e.to_string())?;
-                let code   = emit_module(&module, lang).map_err(|e| e.to_string())?;
+                let module   = analyse(&obj).map_err(|e| e.to_string())?;
 
-                Ok::<_, String>((sections, code))
+                // Extract call graph *before* codegen — we need the IR structure,
+                // not the generated text, to build the graph.
+                let cg = extract_call_graph(&module);
+
+                let code = emit_module(&module, lang).map_err(|e| e.to_string())?;
+
+                Ok::<_, String>((sections, cg, code))
             })
             .await;
 
             // Stream events back to the GTK thread.
             match result {
-                Ok(Ok((sections, code))) => {
+                Ok(Ok((sections, cg, code))) => {
                     let _ = tx.send(BridgeEvent::SectionsLoaded(sections)).await;
                     for (name, src) in code {
                         let _ = tx.send(BridgeEvent::AnalysisFunctionReady(name, src)).await;
                     }
                     let _ = tx.send(BridgeEvent::AnalysisDone).await;
+                    // Send after AnalysisDone so the graph panel appears once
+                    // the code view is already populated.
+                    let _ = tx.send(BridgeEvent::CallGraphReady(Arc::new(cg))).await;
                 }
                 Ok(Err(msg)) => { let _ = tx.send(BridgeEvent::AnalysisError(msg)).await; }
                 Err(e)       => { let _ = tx.send(BridgeEvent::AnalysisError(e.to_string())).await; }
             }
         });
     }
+}
+
+// ── Call-graph extraction ─────────────────────────────────────────────────────
+
+/// Walk the `IrModule` and build a complete `CallGraphData`.
+///
+/// This runs on the Tokio blocking thread, so it may take a little time on
+/// large binaries, but it only runs once per file load.
+fn extract_call_graph(module: &IrModule) -> CallGraphData {
+    // ── 1. Index all internal functions ──────────────────────────────────────
+    //
+    // We build two lookup maps:
+    //   * name  → function index  (for `CallTarget::Named`)
+    //   * addr  → function index  (for `CallTarget::Direct`)
+    let mut functions: Vec<CgFunction> = Vec::with_capacity(module.functions.len());
+    let mut name_to_idx: HashMap<String, usize> = HashMap::new();
+    let mut addr_to_idx: HashMap<u64, usize>    = HashMap::new();
+
+    for func in &module.functions {
+        let idx = functions.len();
+        let blocks = func.blocks_sorted();
+        let stmt_count = blocks.iter().map(|b| b.stmts.len()).sum();
+
+        functions.push(CgFunction {
+            name:        func.name.clone(),
+            entry_addr:  func.entry_addr,
+            block_count: blocks.len(),
+            stmt_count,
+        });
+
+        name_to_idx.insert(func.name.clone(), idx);
+        addr_to_idx.insert(func.entry_addr, idx);
+    }
+
+    // ── 2. Extract call edges ─────────────────────────────────────────────────
+    //
+    // For each (caller_idx, callee_name) pair, count the number of call sites
+    // (i.e. how many `call` instructions reference this callee in this caller).
+    //
+    // Key: (caller_idx, callee_name_string)
+    // Value: site count
+    let mut edge_map: HashMap<(usize, String), usize> = HashMap::new();
+
+    for (caller_idx, func) in module.functions.iter().enumerate() {
+        for block in func.blocks_sorted() {
+            for stmt in &block.stmts {
+                let callee_name = match stmt {
+                    Stmt::Assign {
+                        rhs: Expr::Call { target, .. },
+                        ..
+                    } => match target {
+                        CallTarget::Direct(addr) => {
+                            addr_to_idx.get(addr)
+                                .map(|&i| functions[i].name.clone())
+                        }
+                        CallTarget::Named(name) => Some(name.clone()),
+                        // Indirect calls (function pointers) — we can't
+                        // resolve the target statically.
+                        CallTarget::Indirect(_) => None,
+                    },
+                    _ => None,
+                };
+
+                if let Some(name) = callee_name {
+                    // Self-recursion: keep it — it is a real edge.
+                    *edge_map.entry((caller_idx, name)).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // ── 3. Flatten edge map into CgEdge list ──────────────────────────────────
+    let mut edges: Vec<CgEdge> = edge_map
+        .into_iter()
+        .map(|((caller_idx, callee_name), sites)| {
+            let callee_idx = name_to_idx.get(&callee_name).copied();
+            CgEdge { caller_idx, callee_idx, callee_name, sites }
+        })
+        .collect();
+
+    // Sort for deterministic output (stable layout across runs).
+    edges.sort_by(|a, b| {
+        a.caller_idx
+            .cmp(&b.caller_idx)
+            .then(a.callee_name.cmp(&b.callee_name))
+    });
+
+    CallGraphData { functions, edges }
 }
