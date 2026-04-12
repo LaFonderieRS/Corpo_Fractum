@@ -169,9 +169,9 @@ impl GraphPanel {
 
         {
             let state = state.clone();
-            canvas.set_draw_func(move |_area, cr, _w, _h| {
+            canvas.set_draw_func(move |_area, cr, w, h| {
                 let s = state.borrow();
-                render(&s, cr);
+                render(&s, cr, w, h);
             });
         }
 
@@ -519,10 +519,38 @@ fn hit_test(state: &GraphState, wx: f64, wy: f64) -> Option<usize> {
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
-fn render(state: &GraphState, cr: &cairo::Context) {
+fn draw_grid(cr: &cairo::Context, w: i32, h: i32, offset_x: f64, offset_y: f64) {
+    const CELL: f64 = 40.0;
+    // Shift the grid origin so it pans with the canvas content.
+    let ox = ((offset_x % CELL) + CELL) % CELL;
+    let oy = ((offset_y % CELL) + CELL) % CELL;
+
+    cr.set_source_rgba(0.25, 0.28, 0.38, 0.5);
+    cr.set_line_width(0.5);
+
+    let mut x = ox - CELL;
+    while x <= w as f64 {
+        cr.move_to(x, 0.0);
+        cr.line_to(x, h as f64);
+        x += CELL;
+    }
+
+    let mut y = oy - CELL;
+    while y <= h as f64 {
+        cr.move_to(0.0, y);
+        cr.line_to(w as f64, y);
+        y += CELL;
+    }
+
+    cr.stroke().ok();
+}
+
+fn render(state: &GraphState, cr: &cairo::Context, w: i32, h: i32) {
     // Background — painted before the transform so it always fills the widget.
     cr.set_source_rgb(0.118, 0.118, 0.157);
     cr.paint().ok();
+
+    draw_grid(cr, w, h, state.offset_x, state.offset_y);
 
     if state.nodes.is_empty() {
         // Placeholder shown before a binary is opened.
