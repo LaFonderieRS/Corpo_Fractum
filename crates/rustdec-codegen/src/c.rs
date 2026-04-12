@@ -53,15 +53,13 @@ impl CodegenBackend for CBackend {
                     if let Expr::Value(v) = rhs {
                         copy_table.insert(*lhs, v.clone());
                     }
-                    // Propagate StringRef: treat `vN = StringRef(addr)` as
-                    // `vN = Const(addr)` in the copy table so that downstream
-                    // copies (`vM = vN`) flatten all the way to the string
-                    // address and call-arg resolution emits the literal.
-                    if let Expr::StringRef { addr, .. } = rhs {
-                        copy_table.insert(*lhs, Value::Const {
-                            val: *addr,
-                            ty:  IrType::Ptr(Box::new(IrType::UInt(8))),
-                        });
+                    // StringRef variables stay live (not added to copy_table)
+                    // so their assignment is emitted as `vN = "hello"`.  Fix
+                    // the declared type to `uint8_t *` so the C output is
+                    // well-typed; the lifter stamps these as UInt(64) because
+                    // it only sees the raw address at that point.
+                    if let Expr::StringRef { .. } = rhs {
+                        var_decls.insert(*lhs, IrType::Ptr(Box::new(IrType::UInt(8))));
                     }
                 }
             }
@@ -129,12 +127,6 @@ impl CodegenBackend for CBackend {
 
 // ── Copy-propagation helpers ──────────────────────────────────────────────────
 
-/// Resolve copy chains to their terminal value (iterates up to 16 times).
-///
-/// Handles both plain-value chains (`vM = vN = vK = Const(x)`) and
-/// StringRef-seeded chains: when `vN = StringRef(addr)` was collected as
-/// `vN → Const(addr)`, a downstream copy `vM = vN` becomes `vM → Const(addr)`
-/// after flattening, so call-arg resolution can emit the string literal.
 fn flatten_copies(mut table: HashMap<u32, Value>) -> HashMap<u32, Value> {
     for _ in 0..16 {
         let mut changed = false;
