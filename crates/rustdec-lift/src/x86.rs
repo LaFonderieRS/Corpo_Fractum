@@ -193,7 +193,7 @@ fn lift_insn(
         "movsx" | "movsxd" => lift_movsx(dst, src, next_id, regs),
         "mov" | "movabs" | "movzx" | "movz" | "movs" => lift_mov(dst, src, next_id, regs),
 
-        "lea"   => lift_lea(dst, src, next_id, regs),
+        "lea"   => lift_lea(dst, src, next_id, regs, insn.address, insn.size),
         "push"  => lift_push(dst, next_id, regs),
         "pop"   => lift_pop(dst, next_id, regs),
         "leave" => lift_leave(next_id, regs),
@@ -503,8 +503,25 @@ impl<'a> MemExpr<'a> {
     }
 }
 
-fn lift_lea(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
+fn lift_lea(
+    dst: &str, src: &str,
+    next_id: &mut u32, regs: &mut RegisterTable,
+    insn_address: u64, insn_size: usize,
+) -> Vec<Stmt> {
     let expr = MemExpr::parse(src);
+
+    // RIP-relative: resolve to an absolute address at lift time so downstream
+    // passes see a plain constant rather than an opaque RIP arithmetic chain.
+    if expr.base == Some("rip") {
+        let rip = insn_address + insn_size as u64;
+        let effective = rip.wrapping_add(expr.disp.unwrap_or(0) as u64);
+        let addr_val  = Value::Const { val: effective, ty: IrType::UInt(64) };
+        let (dst_id, _) = fresh(next_id, IrType::UInt(64));
+        regs.set(dst, dst_id);
+        return vec![Stmt::Assign { lhs: dst_id, ty: IrType::UInt(64),
+            rhs: Expr::Value(addr_val) }];
+    }
+
     let (mut stmts, addr_val) = expr.emit_addr(next_id, regs);
     let (dst_id, _) = fresh(next_id, IrType::UInt(64));
     regs.set(dst, dst_id);
