@@ -8,8 +8,8 @@ pub mod x86;
 
 use petgraph::visit::NodeIndexable;
 use rustdec_disasm::Instruction;
-use rustdec_ir::{Expr, IrFunction, IrType, Stmt, Terminator, Value};
-use std::collections::HashSet;
+use rustdec_ir::{BinOp, Expr, IrFunction, IrType, Stmt, Terminator, Value};
+use std::collections::{HashMap, HashSet};
 use rustdec_loader::StringTable;
 use tracing::{debug, instrument, trace};
 
@@ -76,6 +76,10 @@ pub fn lift_function(
     // This eliminates flag-computation noise (e.g. `v1 = (v0 == 0x0)` when
     // the flag is not consumed by any branch or expression).
     eliminate_dead_assigns(func);
+
+    // Back-propagation: resolve string addresses that require evaluating IR
+    // arithmetic (e.g. RIP-relative LEA left as a BinOp by the lifter).
+    backprop_string_refs(func, string_table);
 
     // Annotate constant addresses that point to known strings.
     annotate_string_refs(func, string_table);
@@ -188,6 +192,153 @@ fn annotate_expr(
         }
 
         _ => {}
+    }
+}
+
+// ── Back-propagation string resolution ───────────────────────────────────────
+
+/// Resolve string-address SSA chains that the per-instruction lifter could not
+/// fold at lift time.
+///
+/// [`annotate_string_refs`] handles the common case where a constant is stored
+/// directly into an SSA variable (`vN = 0x401180`).  This pass covers the
+/// harder pattern where the address is produced by IR arithmetic — typically a
+/// RIP-relative LEA left as a `BinOp` — and may cross any number of blocks or
+/// copy steps:
+///
+/// ```text
+/// vRIP = 0x402005          ; next-instruction RIP value
+/// vN   = vRIP + 0xffb      ; LEA effective address (still a BinOp)
+/// vM   = vN                ; copy
+/// call puts(vM)            ; ← backprop resolves this to "Hello\n"
+/// ```
+///
+/// The pass is architecture-agnostic: it operates entirely on IR expressions,
+/// not on machine-code operands.
+///
+/// Two rewrites are performed:
+///
+/// 1. **Arithmetic / cast → StringRef** — if an `Assign` whose RHS is a
+///    `BinOp` or `Cast` evaluates to a string address the RHS is replaced with
+///    `Expr::StringRef`.  Subsequent copy-propagation in the codegen then
+///    threads the string through to call sites automatically.
+///
+/// 2. **Call-arg Var → Const** — if a call argument `Var(id)` traces to a
+///    string address (even through chains not covered by rule 1) the argument
+///    is replaced with a typed `Const(addr)` so the existing call-arg
+///    annotation in [`annotate_string_refs`] can emit the literal.
+fn backprop_string_refs(func: &mut IrFunction, strings: &StringTable) {
+    use petgraph::visit::NodeIndexable;
+
+    if strings.is_empty() { return; }
+
+    let const_eval = build_const_eval(func);
+    let node_count = func.cfg.node_count();
+
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &mut func.cfg[idx].stmts {
+            if let Stmt::Assign { rhs, .. } = stmt {
+                match rhs {
+                    // ── Rule 1: arithmetic / cast that folds to a string addr ─
+                    Expr::BinOp { .. } | Expr::Cast { .. } => {
+                        if let Some(addr) = try_eval_expr(rhs, &const_eval) {
+                            if let Some(content) = strings.get(&addr) {
+                                trace!(addr    = format_args!("{:#x}", addr),
+                                       content = %content,
+                                       "backprop: folded arithmetic → StringRef");
+                                *rhs = Expr::StringRef { addr, content: content.clone() };
+                            }
+                        }
+                    }
+                    // ── Rule 2: call arg Var that traces to a string addr ─────
+                    Expr::Call { args, .. } => {
+                        for arg in args.iter_mut() {
+                            if let Value::Var { id, .. } = arg {
+                                if let Some(&addr) = const_eval.get(id) {
+                                    if strings.contains_key(&addr) {
+                                        trace!(id,
+                                               addr = format_args!("{:#x}", addr),
+                                               "backprop: call arg Var → Const(addr)");
+                                        *arg = Value::Const {
+                                            val: addr,
+                                            ty:  IrType::Ptr(Box::new(IrType::UInt(8))),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Build a map of `SSA id → u64` for every variable whose full expression
+/// chain can be reduced to a constant.
+///
+/// A fixed-point loop (≤ 16 iterations) handles forward references: if `vA`
+/// is defined before `vB` in block order but `vA = vB + 1`, the second pass
+/// will resolve `vA` once `vB` is known.  In practice, straight-line SSA
+/// converges in 1–2 iterations.
+fn build_const_eval(func: &IrFunction) -> HashMap<u32, u64> {
+    use petgraph::visit::NodeIndexable;
+
+    let mut eval: HashMap<u32, u64> = HashMap::new();
+    let node_count = func.cfg.node_count();
+
+    for _ in 0..16 {
+        let mut changed = false;
+        for ni in 0..node_count {
+            let idx = func.cfg.from_index(ni);
+            for stmt in &func.cfg[idx].stmts {
+                if let Stmt::Assign { lhs, rhs, .. } = stmt {
+                    if eval.contains_key(lhs) { continue; }
+                    if let Some(v) = try_eval_expr(rhs, &eval) {
+                        eval.insert(*lhs, v);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed { break; }
+    }
+    eval
+}
+
+/// Try to reduce `expr` to a `u64` constant given the already-known map.
+/// Returns `None` for expressions that cannot be fully evaluated (e.g. loads,
+/// calls, or variables whose definition chain is not yet resolved).
+fn try_eval_expr(expr: &Expr, eval: &HashMap<u32, u64>) -> Option<u64> {
+    match expr {
+        Expr::Value(v)               => try_eval_value(v, eval),
+        Expr::Cast  { val, .. }      => try_eval_value(val, eval),
+        Expr::BinOp { op, lhs, rhs } => {
+            let l = try_eval_value(lhs, eval)?;
+            let r = try_eval_value(rhs, eval)?;
+            Some(match op {
+                BinOp::Add  => l.wrapping_add(r),
+                BinOp::Sub  => l.wrapping_sub(r),
+                BinOp::Mul  => l.wrapping_mul(r),
+                BinOp::And  => l & r,
+                BinOp::Or   => l | r,
+                BinOp::Xor  => l ^ r,
+                BinOp::Shl  => l.wrapping_shl(r as u32),
+                BinOp::LShr => l.wrapping_shr(r as u32),
+                BinOp::AShr => ((l as i64).wrapping_shr(r as u32)) as u64,
+                _           => return None,  // division, remainder, comparisons
+            })
+        }
+        _ => None,
+    }
+}
+
+fn try_eval_value(v: &Value, eval: &HashMap<u32, u64>) -> Option<u64> {
+    match v {
+        Value::Const { val, .. } => Some(*val),
+        Value::Var   { id,  .. } => eval.get(id).copied(),
     }
 }
 
