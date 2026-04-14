@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use rustdec_analysis::{structure_function, CondExpr, SNode};
 use rustdec_lift::frame::{is_slot_id, slot_id_to_offset};
-use rustdec_ir::{BinOp, BasicBlock, CallTarget, Expr, IrFunction, IrType, Stmt, Terminator, Value};
+use rustdec_ir::{BinOp, BasicBlock, CallTarget, Expr, IrFunction, IrType, SymbolKind, Stmt, Terminator, Value};
 use tracing::{debug, trace, warn};
 
-use crate::{CodegenBackend, CodegenResult};
+use crate::{CodegenBackend, CodegenResult, libc_signatures};
 
 // ── Convenience type aliases used throughout this module ──────────────────────
 
@@ -53,12 +53,11 @@ impl CodegenBackend for CBackend {
                     if let Expr::Value(v) = rhs {
                         copy_table.insert(*lhs, v.clone());
                     }
-                    // StringRef variables stay live (not added to copy_table)
-                    // so their assignment is emitted as `vN = "hello"`.  Fix
-                    // the declared type to `uint8_t *` so the C output is
-                    // well-typed; the lifter stamps these as UInt(64) because
-                    // it only sees the raw address at that point.
-                    if let Expr::StringRef { .. } = rhs {
+                    // Symbol variables (strings in particular) stay live — not
+                    // added to copy_table — so the assignment is emitted as
+                    // `vN = "hello"`.  Fix the declared type to `uint8_t *` for
+                    // strings; function / global symbols keep their inferred type.
+                    if let Expr::Symbol { kind: SymbolKind::String, .. } = rhs {
                         var_decls.insert(*lhs, IrType::Ptr(Box::new(IrType::UInt(8))));
                     }
                 }
@@ -367,19 +366,33 @@ impl CBackend {
                 format!("*({}*){}", self.emit_type(ty), p)
             }
 
-            Expr::Call { target, args, .. } => {
-                let tgt = match target {
-                    CallTarget::Direct(a)   => format!("sub_{a:x}"),
-                    CallTarget::Named(n)    => n.clone(),
+            Expr::Call { target, args, ret_ty } => {
+                let (tgt, known_sig) = match target {
+                    CallTarget::Direct(a)   => (format!("sub_{a:x}"), None),
+                    CallTarget::Named(n)    => {
+                        let sig = libc_signatures::lookup(n);
+                        (n.clone(), sig)
+                    }
                     CallTarget::Indirect(v) => {
                         let r = resolve(v, copies);
                         warn!(ptr = %r.display(), "C: indirect call");
-                        format!("(*(void*(*)(...))({}))", r.display())
+                        (format!("(*(void*(*)(...))({}))", r.display()), None)
                     }
                 };
+
+                // Determine which args to emit.  For known-variadic functions
+                // keep all; for known-fixed functions trim excess args; for
+                // unknown functions keep args that have been written.
+                let n_fixed = known_sig.map(|s| s.params.len()).unwrap_or(usize::MAX);
+                let variadic = known_sig.map(|s| s.variadic).unwrap_or(false);
+
                 let filtered: Vec<String> = args
                     .iter()
-                    .filter_map(|a| {
+                    .enumerate()
+                    .filter_map(|(i, a)| {
+                        // Drop args beyond fixed param count unless variadic.
+                        if !variadic && i >= n_fixed { return None; }
+
                         let r = resolve(a, copies);
                         match r {
                             Value::Const { val, .. } => {
@@ -400,7 +413,16 @@ impl CBackend {
                         }
                     })
                     .collect();
-                format!("{tgt}({})", filtered.join(", "))
+
+                // Emit a cast when the known return type differs from what the
+                // lifter inferred (UInt(64) for everything).
+                let call_expr = format!("{tgt}({})", filtered.join(", "));
+                if let Some(sig) = known_sig {
+                    if sig.ret != *ret_ty && sig.ret != rustdec_ir::IrType::Void {
+                        return format!("({}){call_expr}", self.emit_type(&sig.ret));
+                    }
+                }
+                call_expr
             }
 
             Expr::Cast { val, to } => {
@@ -410,10 +432,11 @@ impl CBackend {
 
             Expr::Opaque(s) => format!("/* {s} */"),
 
-            Expr::StringRef { addr, content } => {
-                let text = self.string_table.get(addr).unwrap_or(content);
-                format!("\"{}\"", escape_c_string(text))
-            }
+            Expr::Symbol { kind, name, .. } => match kind {
+                SymbolKind::String   => format!("\"{}\"", escape_c_string(name)),
+                SymbolKind::Function => name.clone(),
+                SymbolKind::Global   => name.clone(),
+            },
         }
     }
 }

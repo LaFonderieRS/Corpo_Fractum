@@ -89,6 +89,20 @@ pub enum BinOp { Add, Sub, Mul, UDiv, SDiv, URem, SRem,
                  And, Or, Xor, Shl, LShr, AShr,
                  Eq, Ne, Ult, Ule, Slt, Sle }
 
+/// Semantic kind of a resolved symbolic reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SymbolKind {
+    /// A null-terminated string literal (`.rodata`, `.rdata`, `__cstring`, …).
+    /// `Expr::Symbol::name` holds the decoded UTF-8 content.
+    String,
+    /// A function — either a direct named reference or a function pointer.
+    /// `Expr::Symbol::name` holds the function identifier.
+    Function,
+    /// A global variable.
+    /// `Expr::Symbol::name` holds the variable identifier.
+    Global,
+}
+
 /// An expression — the right-hand side of an assignment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
@@ -104,9 +118,14 @@ pub enum Expr {
     Cast { val: Value, to: IrType },
     /// Unresolved / opaque expression.
     Opaque(String),
-    /// Reference to a known string literal in the binary image.
-    /// `addr` is the virtual address; `content` is the decoded text.
-    StringRef { addr: u64, content: String },
+    /// Resolved symbolic reference — a string literal, function, or global
+    /// whose virtual address was found in the binary's symbol/string tables.
+    ///
+    /// - `addr`: virtual address in the loaded image.
+    /// - `kind`: semantic classification; drives codegen output.
+    /// - `name`: for `String` — decoded text content;
+    ///           for `Function` / `Global` — the symbol identifier.
+    Symbol { addr: u64, kind: SymbolKind, name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

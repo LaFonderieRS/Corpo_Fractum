@@ -15,6 +15,7 @@ pub use dwarf::{
     DwarfType, DwarfTypeKind, LineEntry,
 };
 pub use strings::{extract_strings, StringTable};
+pub use symbols::{build_symbol_map, SymbolEntry, SymbolMap, SymbolMapKind};
 
 #[derive(Debug, Error)]
 pub enum LoadError {
@@ -35,6 +36,7 @@ mod binary;
 pub mod dwarf;
 mod loaders;
 mod strings;
+mod symbols;
 
 /// Load a binary from disk.
 #[instrument(skip_all, fields(path = %path.as_ref().display()))]

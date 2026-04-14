@@ -3,7 +3,7 @@
 //! Emits idiomatic-ish Rust: `fn`, `let`, `u64`, raw pointers.
 //! All pointer dereferences are wrapped in `unsafe`.
 
-use rustdec_ir::{BinOp, CallTarget, Expr, IrFunction, IrType, Stmt, Terminator};
+use rustdec_ir::{BinOp, CallTarget, Expr, IrFunction, IrType, SymbolKind, Stmt, Terminator};
 use tracing::{debug, trace, warn};
 
 use crate::{CodegenBackend, CodegenResult};
@@ -125,9 +125,11 @@ impl RustBackend {
                 warn!(expr = %s, "Rust: opaque expression");
                 format!("/* {s} */ todo!()")
             }
-            Expr::StringRef { content, .. } => {
-                format!("b\"{}\\0\".as_ptr()", escape_rust_str(content))
-            }
+            Expr::Symbol { kind, name, .. } => match kind {
+                SymbolKind::String   => format!("b\"{}\\0\".as_ptr()", escape_rust_str(name)),
+                SymbolKind::Function => sanitise_rust(name),
+                SymbolKind::Global   => sanitise_rust(name),
+            },
         }
     }
 

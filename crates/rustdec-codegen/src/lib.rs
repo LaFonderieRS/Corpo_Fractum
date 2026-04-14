@@ -4,6 +4,7 @@
 
 pub mod c;
 pub mod cpp;
+pub mod libc_signatures;
 pub mod rust;
 
 use rustdec_ir::{IrFunction, IrModule};

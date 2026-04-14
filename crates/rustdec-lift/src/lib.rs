@@ -8,21 +8,22 @@ pub mod x86;
 
 use petgraph::visit::NodeIndexable;
 use rustdec_disasm::Instruction;
-use rustdec_ir::{BinOp, Expr, IrFunction, IrType, Stmt, Terminator, Value};
+use rustdec_ir::{BinOp, Expr, IrFunction, IrType, SymbolKind, Stmt, Terminator, Value};
+use rustdec_loader::{SymbolMap, SymbolMapKind};
 use std::collections::{HashMap, HashSet};
-use rustdec_loader::StringTable;
 use tracing::{debug, instrument, trace};
 
 /// Lift all basic blocks of `func` in-place, then analyse the stack frame.
 ///
-/// `string_table` maps virtual addresses to decoded string content — when the
-/// lifter encounters a `Value::Const` pointing into that table it replaces it
-/// with `Expr::StringRef` so the codegen can emit a string literal.
+/// `symbols` is the unified symbol map produced by
+/// [`rustdec_loader::build_symbol_map`].  The lifter uses it to annotate any
+/// SSA variable whose value chain resolves to a known symbol address as an
+/// [`Expr::Symbol`] node, covering strings, functions, and global variables.
 #[instrument(skip_all, fields(func = %func.name))]
 pub fn lift_function(
-    func:         &mut IrFunction,
-    insns:        &[Instruction],
-    string_table: &StringTable,
+    func:    &mut IrFunction,
+    insns:   &[Instruction],
+    symbols: &SymbolMap,
 ) {
     debug!(func = %func.name, blocks = func.cfg.node_count(), "lifting function");
 
@@ -73,16 +74,10 @@ pub fn lift_function(
     infer_return_type(func);
 
     // Dead code elimination — remove Assign stmts whose lhs is never read.
-    // This eliminates flag-computation noise (e.g. `v1 = (v0 == 0x0)` when
-    // the flag is not consumed by any branch or expression).
     eliminate_dead_assigns(func);
 
-    // Back-propagation: resolve string addresses that require evaluating IR
-    // arithmetic (e.g. RIP-relative LEA left as a BinOp by the lifter).
-    backprop_string_refs(func, string_table);
-
-    // Annotate constant addresses that point to known strings.
-    annotate_string_refs(func, string_table);
+    // Resolve all constant addresses to symbolic IR nodes in a single pass.
+    resolve_constants(func, symbols);
 
     // Frame analysis — runs last so it sees fully annotated stmts.
     frame::analyse_frame(func);
@@ -94,143 +89,29 @@ pub fn lift_function(
            "lift complete");
 }
 
-// ── String annotation pass ────────────────────────────────────────────────────
+// ── Constant resolution pass ──────────────────────────────────────────────────
 
-/// Walk every stmt in `func` and replace constant addresses with `StringRef`.
+/// Single-entry-point pass that resolves every SSA chain reachable from a
+/// known symbol address to an [`Expr::Symbol`] node.
 ///
-/// Two-pass strategy over the whole function:
+/// This pass is **architecture-agnostic**: it operates on IR expressions, not
+/// on machine-code operands.  It covers:
 ///
-/// 1. Build a **function-wide** copy-table mapping `SSA id → address` for every
-///    `Assign { rhs: Value(Const(addr)) }` across all blocks.  Because SSA
-///    guarantees each lhs is unique across the function there are no cross-block
-///    collisions, so the single map covers constants defined in any block that
-///    are used in calls in a different block.
+/// * Direct constant assignment — `vN = 0x401180` (MOV absolute)
+/// * Arithmetic chains — `vN = vRIP + 0xfff` (RIP-relative LEA)
+/// * Multi-block copy chains — `vM = vN` after any of the above
 ///
-/// 2. Rewrite:
-///    - `Assign { rhs: Expr::Value(Const(addr)) }` → `StringRef`  (direct)
-///    - `Assign { rhs: Expr::Call { args } }` where an arg is `Var(id)` and
-///      `const_map[id]` is a known string address → replace the arg with a
-///      synthetic `Const(addr)` so the codegen lookup works.
-///
-/// This handles the common pattern:
-/// ```asm
-/// mov  rdi, 0x401180   ; lifter: vN = 0x401180
-/// call puts            ; lifter: call puts(vN, …)
-/// ```
-/// The copy-table lets us see that `vN == 0x401180` at the call site even when
-/// the assignment and the call live in separate basic blocks.
-fn annotate_string_refs(func: &mut IrFunction, strings: &StringTable) {
-    use petgraph::visit::NodeIndexable;
-    use rustdec_ir::Expr;
-
-    if strings.is_empty() { return; }
-
-    let node_count = func.cfg.node_count();
-
-    // Pass 1 — build function-wide const map: SSA id → address.
-    let mut const_map: std::collections::HashMap<u32, u64> =
-        std::collections::HashMap::new();
-    for ni in 0..node_count {
-        let idx = func.cfg.from_index(ni);
-        for stmt in &func.cfg[idx].stmts {
-            if let Stmt::Assign { lhs, rhs: Expr::Value(Value::Const { val, .. }), .. } = stmt {
-                const_map.insert(*lhs, *val);
-            }
-        }
-    }
-
-    // Pass 2 — rewrite expressions using the global const map.
-    for ni in 0..node_count {
-        let idx = func.cfg.from_index(ni);
-        for stmt in &mut func.cfg[idx].stmts {
-            if let Stmt::Assign { rhs, .. } = stmt {
-                annotate_expr(rhs, strings, &const_map);
-            }
-        }
-    }
-}
-
-fn annotate_expr(
-    expr:      &mut rustdec_ir::Expr,
-    strings:   &StringTable,
-    const_map: &std::collections::HashMap<u32, u64>,
-) {
-    use rustdec_ir::Expr;
-
-    match expr {
-        // Direct: `mov reg, <string_addr>` → StringRef.
-        Expr::Value(Value::Const { val, .. }) => {
-            if let Some(content) = strings.get(val) {
-                trace!(addr = format_args!("{:#x}", val),
-                       content = %content, "string ref annotated (direct)");
-                *expr = Expr::StringRef { addr: *val, content: content.clone() };
-            }
-        }
-
-        // Call: resolve Var args through the block-local copy table.
-        // If an arg Var(id) was assigned from a string address, replace it
-        // with a Const(addr) so the codegen StringRef lookup fires.
-        Expr::Call { args, .. } => {
-            for arg in args.iter_mut() {
-                let resolved_addr = match arg {
-                    Value::Const { val, .. } => Some(*val),
-                    Value::Var   { id, .. }  => const_map.get(id).copied(),
-                };
-                if let Some(addr) = resolved_addr {
-                    if strings.contains_key(&addr) {
-                        // Replace with a Const pointing to the string so that
-                        // emit_expr_resolved will see it as a StringRef when
-                        // it evaluates Value::Const against string_table.
-                        *arg = Value::Const { val: addr, ty: rustdec_ir::IrType::Ptr(
-                            Box::new(rustdec_ir::IrType::UInt(8))
-                        )};
-                        trace!(addr = format_args!("{:#x}", addr),
-                               "call arg resolved to string addr");
-                    }
-                }
-            }
-        }
-
-        _ => {}
-    }
-}
-
-// ── Back-propagation string resolution ───────────────────────────────────────
-
-/// Resolve string-address SSA chains that the per-instruction lifter could not
-/// fold at lift time.
-///
-/// [`annotate_string_refs`] handles the common case where a constant is stored
-/// directly into an SSA variable (`vN = 0x401180`).  This pass covers the
-/// harder pattern where the address is produced by IR arithmetic — typically a
-/// RIP-relative LEA left as a `BinOp` — and may cross any number of blocks or
-/// copy steps:
-///
-/// ```text
-/// vRIP = 0x402005          ; next-instruction RIP value
-/// vN   = vRIP + 0xffb      ; LEA effective address (still a BinOp)
-/// vM   = vN                ; copy
-/// call puts(vM)            ; ← backprop resolves this to "Hello\n"
-/// ```
-///
-/// The pass is architecture-agnostic: it operates entirely on IR expressions,
-/// not on machine-code operands.
-///
-/// Two rewrites are performed:
-///
-/// 1. **Arithmetic / cast → StringRef** — if an `Assign` whose RHS is a
-///    `BinOp` or `Cast` evaluates to a string address the RHS is replaced with
-///    `Expr::StringRef`.  Subsequent copy-propagation in the codegen then
-///    threads the string through to call sites automatically.
-///
-/// 2. **Call-arg Var → Const** — if a call argument `Var(id)` traces to a
-///    string address (even through chains not covered by rule 1) the argument
-///    is replaced with a typed `Const(addr)` so the existing call-arg
-///    annotation in [`annotate_string_refs`] can emit the literal.
-fn backprop_string_refs(func: &mut IrFunction, strings: &StringTable) {
-    use petgraph::visit::NodeIndexable;
-
-    if strings.is_empty() { return; }
+/// The algorithm:
+/// 1. Build a function-wide **const-eval map** (`SSA id → u64`) by folding
+///    every expression that can be fully reduced to a constant through a
+///    fixed-point iteration.
+/// 2. Walk all `Assign` statements once:
+///    - If the RHS evaluates to a symbol address → replace with `Expr::Symbol`.
+///    - If a call argument `Var(id)` evaluates to a string address → replace
+///      with a typed `Const(addr)` so the codegen's fallback path emits the
+///      string literal (since `Value` cannot carry an `Expr` directly).
+fn resolve_constants(func: &mut IrFunction, symbols: &SymbolMap) {
+    if symbols.is_empty() { return; }
 
     let const_eval = build_const_eval(func);
     let node_count = func.cfg.node_count();
@@ -240,30 +121,56 @@ fn backprop_string_refs(func: &mut IrFunction, strings: &StringTable) {
         for stmt in &mut func.cfg[idx].stmts {
             if let Stmt::Assign { rhs, .. } = stmt {
                 match rhs {
-                    // ── Rule 1: arithmetic / cast that folds to a string addr ─
-                    Expr::BinOp { .. } | Expr::Cast { .. } => {
-                        if let Some(addr) = try_eval_expr(rhs, &const_eval) {
-                            if let Some(content) = strings.get(&addr) {
-                                trace!(addr    = format_args!("{:#x}", addr),
-                                       content = %content,
-                                       "backprop: folded arithmetic → StringRef");
-                                *rhs = Expr::StringRef { addr, content: content.clone() };
+                    // ── Direct constant or copy-of-constant → Symbol ──────────
+                    Expr::Value(Value::Const { val, .. }) => {
+                        if let Some(entry) = symbols.get(val) {
+                            trace!(addr  = format_args!("{:#x}", val),
+                                   name  = %entry.name,
+                                   "resolve_constants: Const → Symbol");
+                            *rhs = symbol_expr(*val, entry);
+                        }
+                    }
+                    Expr::Value(Value::Var { id, .. }) => {
+                        if let Some(&addr) = const_eval.get(id) {
+                            if let Some(entry) = symbols.get(&addr) {
+                                trace!(id,
+                                       addr  = format_args!("{:#x}", addr),
+                                       name  = %entry.name,
+                                       "resolve_constants: Var copy → Symbol");
+                                *rhs = symbol_expr(addr, entry);
                             }
                         }
                     }
-                    // ── Rule 2: call arg Var that traces to a string addr ─────
+                    // ── Arithmetic / cast that folds to a symbol addr → Symbol ─
+                    Expr::BinOp { .. } | Expr::Cast { .. } => {
+                        if let Some(addr) = try_eval_expr(rhs, &const_eval) {
+                            if let Some(entry) = symbols.get(&addr) {
+                                trace!(addr  = format_args!("{:#x}", addr),
+                                       name  = %entry.name,
+                                       "resolve_constants: arithmetic → Symbol");
+                                *rhs = symbol_expr(addr, entry);
+                            }
+                        }
+                    }
+                    // ── Call site: resolve Var args that trace to a symbol ─────
+                    //
+                    // `Value` cannot carry an `Expr::Symbol` so for string args
+                    // we replace with `Const(addr)` — the codegen checks the
+                    // string_table for every `Const` call arg.
                     Expr::Call { args, .. } => {
                         for arg in args.iter_mut() {
                             if let Value::Var { id, .. } = arg {
                                 if let Some(&addr) = const_eval.get(id) {
-                                    if strings.contains_key(&addr) {
-                                        trace!(id,
-                                               addr = format_args!("{:#x}", addr),
-                                               "backprop: call arg Var → Const(addr)");
-                                        *arg = Value::Const {
-                                            val: addr,
-                                            ty:  IrType::Ptr(Box::new(IrType::UInt(8))),
-                                        };
+                                    if let Some(entry) = symbols.get(&addr) {
+                                        if entry.kind == SymbolMapKind::String {
+                                            trace!(id,
+                                                   addr = format_args!("{:#x}", addr),
+                                                   "resolve_constants: call arg → Const(addr)");
+                                            *arg = Value::Const {
+                                                val: addr,
+                                                ty:  IrType::Ptr(Box::new(IrType::UInt(8))),
+                                            };
+                                        }
                                     }
                                 }
                             }
@@ -276,6 +183,18 @@ fn backprop_string_refs(func: &mut IrFunction, strings: &StringTable) {
     }
 }
 
+/// Build an [`Expr::Symbol`] from a symbol map entry.
+fn symbol_expr(addr: u64, entry: &rustdec_loader::SymbolEntry) -> Expr {
+    let kind = match entry.kind {
+        SymbolMapKind::String   => SymbolKind::String,
+        SymbolMapKind::Function => SymbolKind::Function,
+        SymbolMapKind::Global   => SymbolKind::Global,
+    };
+    Expr::Symbol { addr, kind, name: entry.name.clone() }
+}
+
+// ── Constant folding helpers ──────────────────────────────────────────────────
+
 /// Build a map of `SSA id → u64` for every variable whose full expression
 /// chain can be reduced to a constant.
 ///
@@ -284,8 +203,6 @@ fn backprop_string_refs(func: &mut IrFunction, strings: &StringTable) {
 /// will resolve `vA` once `vB` is known.  In practice, straight-line SSA
 /// converges in 1–2 iterations.
 fn build_const_eval(func: &IrFunction) -> HashMap<u32, u64> {
-    use petgraph::visit::NodeIndexable;
-
     let mut eval: HashMap<u32, u64> = HashMap::new();
     let node_count = func.cfg.node_count();
 
@@ -309,8 +226,6 @@ fn build_const_eval(func: &IrFunction) -> HashMap<u32, u64> {
 }
 
 /// Try to reduce `expr` to a `u64` constant given the already-known map.
-/// Returns `None` for expressions that cannot be fully evaluated (e.g. loads,
-/// calls, or variables whose definition chain is not yet resolved).
 fn try_eval_expr(expr: &Expr, eval: &HashMap<u32, u64>) -> Option<u64> {
     match expr {
         Expr::Value(v)               => try_eval_value(v, eval),
@@ -328,7 +243,7 @@ fn try_eval_expr(expr: &Expr, eval: &HashMap<u32, u64>) -> Option<u64> {
                 BinOp::Shl  => l.wrapping_shl(r as u32),
                 BinOp::LShr => l.wrapping_shr(r as u32),
                 BinOp::AShr => ((l as i64).wrapping_shr(r as u32)) as u64,
-                _           => return None,  // division, remainder, comparisons
+                _           => return None,
             })
         }
         _ => None,
@@ -366,8 +281,6 @@ fn infer_return_type(func: &mut IrFunction) {
 ///
 /// **Preserved**: `Store` and `Nop` are always kept — stores have side effects.
 fn eliminate_dead_assigns(func: &mut IrFunction) {
-    use petgraph::visit::NodeIndexable;
-
     loop {
         // ── Step 1: collect all ids that are READ somewhere ─────────────────
         let mut live: HashSet<u32> = HashSet::new();
@@ -392,15 +305,7 @@ fn eliminate_dead_assigns(func: &mut IrFunction) {
             let idx = func.cfg.from_index(ni);
             let before = func.cfg[idx].stmts.len();
             func.cfg[idx].stmts.retain(|stmt| match stmt {
-                Stmt::Assign { lhs, .. } => {
-                    // Keep if lhs is live OR if it's a seeded ABI register
-                    // (ids < next_var_id at the time of seeding — we keep all
-                    // Assigns unconditionally for the seed ids since they are
-                    // not emitted as stmts anyway; the retain only sees stmts
-                    // actually generated by the lifter).
-                    live.contains(lhs)
-                }
-                // Stores and Nops always kept.
+                Stmt::Assign { lhs, .. } => live.contains(lhs),
                 _ => true,
             });
             removed += before - func.cfg[idx].stmts.len();
@@ -436,7 +341,7 @@ fn collect_reads_expr(expr: &Expr, live: &mut HashSet<u32>) {
         Expr::Call { args, .. }            => {
             for a in args { collect_reads_value(a, live); }
         }
-        Expr::StringRef { .. }             => {}
+        Expr::Symbol { .. }                => {}
         Expr::Opaque(_)                    => {}
     }
 }
@@ -457,7 +362,6 @@ fn collect_reads_terminator(term: &Terminator, live: &mut HashSet<u32>) {
 
 /// Return the return value of the function if it is a `Var`, else `None`.
 fn return_value(func: &IrFunction) -> Option<Value> {
-    use petgraph::visit::NodeIndexable;
     let n = func.cfg.node_count();
     for ni in 0..n {
         let idx = func.cfg.from_index(ni);

@@ -16,7 +16,7 @@ pub use functions::detect_functions;
 pub use structure::{structure_function, StructuredFunc, SNode, CondExpr};
 
 use rustdec_ir::IrModule;
-use rustdec_loader::{BinaryObject, extract_strings};
+use rustdec_loader::{BinaryObject, build_symbol_map, extract_strings};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
@@ -82,6 +82,9 @@ pub fn analyse(obj: &BinaryObject) -> AnalysisResult<IrModule> {
     info!(total_instructions = all_insns.len(), "disassembly complete");
     info!(strings = string_table.len(), "string table built");
 
+    let symbol_map = build_symbol_map(obj, &string_table);
+    info!(symbols = symbol_map.len(), "symbol map built");
+
     // ── 2. Detect functions ───────────────────────────────────────────────────
     let entry_points = detect_functions(obj, &all_insns);
     info!(functions = entry_points.len(), "function detection complete");
@@ -136,7 +139,7 @@ pub fn analyse(obj: &BinaryObject) -> AnalysisResult<IrModule> {
                    edges  = func.cfg.edge_count(),
                    "CFG complete — lifting");
 
-            lift_function(&mut func, &all_insns, &string_table);
+            lift_function(&mut func, &all_insns, &symbol_map);
 
             let total_stmts: usize = func.blocks_sorted()
                 .iter()
