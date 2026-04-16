@@ -294,7 +294,7 @@ impl IrFunction {
     ///
     /// `ty` is used only when creating a new slot — existing slots keep their
     /// previously inferred type.
-    pub fn get_or_insert_slot(&mut self, rbp_offset: i64, ty: IrType) -> &StackSlot {
+    pub fn get_or_insert_slot(&mut self, rbp_offset: i64, ty: IrType) -> &mut StackSlot {
         self.slot_table.entry(rbp_offset).or_insert_with(|| {
             let (name, origin) = classify_slot(rbp_offset);
             StackSlot { rbp_offset, ty, name, origin }
