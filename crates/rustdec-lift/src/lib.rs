@@ -82,8 +82,12 @@ pub fn lift_function(
     // Frame analysis — runs last so it sees fully annotated stmts.
     frame::analyse_frame(func);
 
+    // ABI arity inference — determines func.params from register usage.
+    infer_abi_args(func);
+
     debug!(func    = %func.name,
            ret     = ?func.ret_ty,
+           params  = func.params.len(),
            slots   = func.slot_table.len(),
            frame   = func.frame_size,
            "lift complete");
@@ -370,4 +374,85 @@ fn return_value(func: &IrFunction) -> Option<Value> {
         }
     }
     None
+}
+
+// ── ABI arity inference ───────────────────────────────────────────────────────
+
+/// Infer function arity by scanning which System V x86-64 argument registers
+/// are *read* anywhere in the function body.
+///
+/// For each register in (rdi, rsi, rdx, rcx, r8, r9), check whether its seed
+/// id appears as an operand.  The longest contiguous prefix of read registers
+/// defines the parameter list — arity stops at the first unread register.
+///
+/// If `func.params` is already non-empty (e.g. populated from DWARF), the
+/// pass is skipped.
+///
+/// Type inference heuristic (in priority order):
+/// 1. `Cast(seed, to)` — movzx / sign-extension → use the target type
+/// 2. `Load { ptr: seed }` — seed used as pointer → `Ptr(load_ty)`
+/// 3. Default: `UInt(64)`
+fn infer_abi_args(func: &mut IrFunction) {
+    if !func.params.is_empty() { return; }
+
+    const ARG_ORDER: &[&str] = &["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+
+    // Build reg_name → seed_id map restricted to the arg registers.
+    let mut reg_to_seed: HashMap<&str, u32> = HashMap::new();
+    for (&id, name) in &func.reg_names {
+        for &reg in ARG_ORDER {
+            if name == reg { reg_to_seed.insert(reg, id); }
+        }
+    }
+
+    // Collect all SSA ids that appear as read operands anywhere in the function.
+    let mut live: HashSet<u32> = HashSet::new();
+    let n = func.cfg.node_count();
+    for ni in 0..n {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            collect_reads_stmt(stmt, &mut live);
+        }
+        collect_reads_terminator(&func.cfg[idx].terminator, &mut live);
+    }
+
+    // Determine the arity and infer types for each arg register in ABI order.
+    let mut params: Vec<IrType> = Vec::new();
+    for &reg in ARG_ORDER {
+        let seed = match reg_to_seed.get(reg) {
+            Some(&id) => id,
+            None      => break,
+        };
+        if !live.contains(&seed) { break; } // first unread reg → stop
+        params.push(infer_seed_type(func, seed));
+    }
+
+    if !params.is_empty() {
+        debug!(func = %func.name, arity = params.len(), "ABI arity inferred");
+        func.params = params;
+    }
+}
+
+/// Heuristic type for an argument seed id, based on how it is used.
+fn infer_seed_type(func: &IrFunction, seed: u32) -> IrType {
+    let n = func.cfg.node_count();
+    for ni in 0..n {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            match stmt {
+                // movzx-style cast: seed is being narrowed → use the target type.
+                Stmt::Assign {
+                    rhs: Expr::Cast { val: Value::Var { id, .. }, to }, ..
+                } if *id == seed => return to.clone(),
+
+                // Load through seed: seed is a pointer → Ptr(pointee_ty).
+                Stmt::Assign {
+                    rhs: Expr::Load { ptr: Value::Var { id, .. }, ty }, ..
+                } if *id == seed => return IrType::Ptr(Box::new(ty.clone())),
+
+                _ => {}
+            }
+        }
+    }
+    IrType::UInt(64)
 }

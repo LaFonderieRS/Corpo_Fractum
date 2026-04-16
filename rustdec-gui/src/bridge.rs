@@ -121,35 +121,41 @@ type Callback = Box<dyn Fn(BridgeEvent) + 'static>;
 /// Cheap-to-clone handle. Must only be used from the GTK main thread.
 #[derive(Clone)]
 pub struct AnalysisBridge {
-    listeners:    Rc<RefCell<Vec<Callback>>>,
+    listeners:      Rc<RefCell<Vec<Callback>>>,
     /// `async_channel::Sender` is `Send + Clone` — safe to move into Tokio tasks.
-    tx:           async_channel::Sender<BridgeEvent>,
-    rt:           Handle,
-    language:     Rc<RefCell<Language>>,
+    tx:             async_channel::Sender<BridgeEvent>,
+    rt:             Handle,
+    language:       Rc<RefCell<Language>>,
     /// Stores decompiled code keyed by function name.
-    function_map: Rc<RefCell<HashMap<String, String>>>,
+    function_map:   Rc<RefCell<HashMap<String, String>>>,
+    /// Records insertion order so `select_all_functions` can concatenate in
+    /// analysis order rather than arbitrary HashMap order.
+    function_order: Rc<RefCell<Vec<String>>>,
     /// Stores section metadata (+ bytes) keyed by section name.
-    section_map:  Rc<RefCell<HashMap<String, SectionMeta>>>,
+    section_map:    Rc<RefCell<HashMap<String, SectionMeta>>>,
 }
 
 impl AnalysisBridge {
     pub fn new(rt: Handle) -> Self {
         let (tx, rx) = async_channel::unbounded::<BridgeEvent>();
-        let listeners:    Rc<RefCell<Vec<Callback>>>                = Rc::new(RefCell::new(vec![]));
-        let function_map: Rc<RefCell<HashMap<String, String>>>      = Rc::new(RefCell::new(HashMap::new()));
-        let section_map:  Rc<RefCell<HashMap<String, SectionMeta>>> = Rc::new(RefCell::new(HashMap::new()));
+        let listeners:      Rc<RefCell<Vec<Callback>>>                = Rc::new(RefCell::new(vec![]));
+        let function_map:   Rc<RefCell<HashMap<String, String>>>      = Rc::new(RefCell::new(HashMap::new()));
+        let function_order: Rc<RefCell<Vec<String>>>                  = Rc::new(RefCell::new(Vec::new()));
+        let section_map:    Rc<RefCell<HashMap<String, SectionMeta>>> = Rc::new(RefCell::new(HashMap::new()));
 
         // Drain the channel on the GTK main thread.
         {
-            let listeners    = listeners.clone();
-            let function_map = function_map.clone();
-            let section_map  = section_map.clone();
+            let listeners      = listeners.clone();
+            let function_map   = function_map.clone();
+            let function_order = function_order.clone();
+            let section_map    = section_map.clone();
             MainContext::default().spawn_local(async move {
                 while let Ok(event) = rx.recv().await {
                     // Populate internal maps before dispatching to subscribers.
                     match &event {
                         BridgeEvent::AnalysisStarted(_) => {
                             function_map.borrow_mut().clear();
+                            function_order.borrow_mut().clear();
                             section_map.borrow_mut().clear();
                         }
                         BridgeEvent::SectionsLoaded(secs) => {
@@ -160,6 +166,7 @@ impl AnalysisBridge {
                         }
                         BridgeEvent::AnalysisFunctionReady(name, code) => {
                             function_map.borrow_mut().insert(name.clone(), code.clone());
+                            function_order.borrow_mut().push(name.clone());
                         }
                         _ => {}
                     }
@@ -174,8 +181,9 @@ impl AnalysisBridge {
             listeners,
             tx,
             rt,
-            language:     Rc::new(RefCell::new(Language::C)),
+            language:       Rc::new(RefCell::new(Language::C)),
             function_map,
+            function_order,
             section_map,
         }
     }
@@ -196,6 +204,31 @@ impl AnalysisBridge {
             for cb in self.listeners.borrow().iter() {
                 cb(event.clone());
             }
+        }
+    }
+
+    /// Concatenate all decompiled functions in analysis order and emit a
+    /// `FunctionSelected("(full script)", combined)` event.
+    ///
+    /// Disabled (no-op) if no functions have been decompiled yet.
+    pub fn select_all_functions(&self) {
+        let order = self.function_order.borrow();
+        if order.is_empty() { return; }
+
+        let map = self.function_map.borrow();
+        let combined: String = order
+            .iter()
+            .filter_map(|name| map.get(name))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        drop(map);
+        drop(order);
+
+        let event = BridgeEvent::FunctionSelected("(full script)".to_string(), combined);
+        for cb in self.listeners.borrow().iter() {
+            cb(event.clone());
         }
     }
 

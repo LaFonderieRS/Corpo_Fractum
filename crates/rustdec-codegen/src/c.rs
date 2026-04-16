@@ -7,7 +7,7 @@ use rustdec_lift::frame::{is_slot_id, slot_id_to_offset};
 use rustdec_ir::{BinOp, BasicBlock, CallTarget, Expr, IrFunction, IrType, SymbolKind, Stmt, Terminator, Value};
 use tracing::{debug, trace, warn};
 
-use crate::{CodegenBackend, CodegenResult, libc_signatures};
+use crate::{CodegenBackend, CodegenResult, libc_signatures, syscalls};
 
 // ── Convenience type aliases used throughout this module ──────────────────────
 
@@ -24,8 +24,29 @@ pub struct CBackend {
 
 impl CodegenBackend for CBackend {
     fn emit_function(&self, func: &IrFunction) -> CodegenResult<String> {
-        let ret    = self.emit_type(&func.ret_ty);
-        let params = if func.params.is_empty() {
+        // If this function has a known libc / CRT signature and the inferred
+        // arity matches, use the known types and parameter names directly.
+        // This turns `uint64_t main(uint64_t a0, uint64_t a1)` into
+        // `int main(int argc, char** argv)` without any extra passes.
+        let known_sig = libc_signatures::lookup(&func.name)
+            .filter(|s| s.params.len() == func.params.len()
+                        || func.params.is_empty() && s.params.is_empty());
+
+        let ret = if let Some(sig) = known_sig {
+            self.emit_type(&sig.ret)
+        } else {
+            self.emit_type(&func.ret_ty)
+        };
+
+        let params = if let Some(sig) = known_sig {
+            if sig.params.is_empty() {
+                "void".to_string()
+            } else {
+                sig.params.iter()
+                    .map(|p| format!("{} {}", self.emit_type(&p.ty), p.name))
+                    .collect::<Vec<_>>().join(", ")
+            }
+        } else if func.params.is_empty() {
             "void".to_string()
         } else {
             func.params.iter().enumerate()
@@ -336,6 +357,65 @@ impl CBackend {
         format!("cond_{:x}", cond.block_addr)
     }
 
+    /// Emit a Linux syscall expression.
+    ///
+    /// The lifter encodes syscalls as `__syscall(nr, rdi, rsi, rdx, r10, r8, r9)`.
+    /// This method:
+    /// 1. Tries to evaluate `args[0]` (the nr) as a constant and looks it up.
+    /// 2. Emits live trailing args (up to the first unwritten var).
+    /// 3. Produces `syscall(SYS_write, fd, buf, n)` or `syscall(nr, ...)`.
+    fn emit_syscall(
+        &self,
+        args:      &[Value],
+        copies:    &HashMap<u32, Value>,
+        written:   &HashSet<u32>,
+        slots:     &SlotMap,
+        reg_names: &RegNames,
+    ) -> String {
+        // Evaluate the syscall number (args[0]).
+        let nr_val = args.first().and_then(|a| {
+            if let Value::Const { val, .. } = resolve(a, copies) {
+                Some(*val)
+            } else {
+                None
+            }
+        });
+
+        let nr_str = nr_val
+            .and_then(|n| syscalls::lookup_nr(n))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                args.first()
+                    .map(|a| display_value(resolve(a, copies), copies, slots, reg_names))
+                    .unwrap_or_else(|| "0".to_string())
+            });
+
+        // Emit the remaining args (args[1..]), dropping trailing unwritten vars.
+        let call_args: Vec<String> = args[1..]
+            .iter()
+            .filter_map(|a| {
+                let r = resolve(a, copies);
+                match r {
+                    Value::Const { .. } =>
+                        Some(display_value(r, copies, slots, reg_names)),
+                    Value::Var { id, .. } => {
+                        if written.contains(id) {
+                            Some(display_value(r, copies, slots, reg_names))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        if call_args.is_empty() {
+            format!("syscall({nr_str})")
+        } else {
+            format!("syscall({nr_str}, {})", call_args.join(", "))
+        }
+    }
+
     fn emit_expr_resolved(
         &self,
         expr:      &Expr,
@@ -367,6 +447,15 @@ impl CBackend {
             }
 
             Expr::Call { target, args, ret_ty } => {
+                // ── syscall special case ──────────────────────────────────────
+                // The lifter emits `__syscall(nr, rdi, rsi, rdx, r10, r8, r9)`.
+                // We look up the nr (args[0]) and emit `syscall(SYS_xxx, ...)`.
+                if let CallTarget::Named(n) = target {
+                    if n == "__syscall" {
+                        return self.emit_syscall(args, copies, written, slots, reg_names);
+                    }
+                }
+
                 let (tgt, known_sig) = match target {
                     CallTarget::Direct(a)   => (format!("sub_{a:x}"), None),
                     CallTarget::Named(n)    => {
@@ -383,20 +472,18 @@ impl CBackend {
                 // Determine which args to emit.  For known-variadic functions
                 // keep all; for known-fixed functions trim excess args; for
                 // unknown functions keep args that have been written.
-                let n_fixed = known_sig.map(|s| s.params.len()).unwrap_or(usize::MAX);
+                let n_fixed  = known_sig.map(|s| s.params.len()).unwrap_or(usize::MAX);
                 let variadic = known_sig.map(|s| s.variadic).unwrap_or(false);
 
                 let filtered: Vec<String> = args
                     .iter()
                     .enumerate()
                     .filter_map(|(i, a)| {
-                        // Drop args beyond fixed param count unless variadic.
                         if !variadic && i >= n_fixed { return None; }
 
                         let r = resolve(a, copies);
                         match r {
                             Value::Const { val, .. } => {
-                                // Check if this constant is a string address.
                                 if let Some(text) = self.string_table.get(val) {
                                     Some(format!("\"{}\"", escape_c_string(text)))
                                 } else {
@@ -414,8 +501,6 @@ impl CBackend {
                     })
                     .collect();
 
-                // Emit a cast when the known return type differs from what the
-                // lifter inferred (UInt(64) for everything).
                 let call_expr = format!("{tgt}({})", filtered.join(", "));
                 if let Some(sig) = known_sig {
                     if sig.ret != *ret_ty && sig.ret != rustdec_ir::IrType::Void {

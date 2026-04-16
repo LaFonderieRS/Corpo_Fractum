@@ -73,10 +73,21 @@ impl ExplorerPanel {
         // ── FUNCTIONS group ───────────────────────────────────────────────────
         let fn_count: Rc<Cell<usize>> = Rc::new(Cell::new(0));
 
+        // Header row: [FUNCTIONS (N)] ............... [full script]
+        let fn_header_row = GtkBox::new(Orientation::Horizontal, 0);
+
         let fn_header = Label::new(Some("FUNCTIONS"));
         fn_header.add_css_class("explorer-group-header");
         fn_header.set_halign(gtk4::Align::Start);
-        content.append(&fn_header);
+        fn_header.set_hexpand(true);
+        fn_header_row.append(&fn_header);
+
+        let full_script_btn = Button::with_label("full script");
+        full_script_btn.add_css_class("full-script-btn");
+        full_script_btn.set_sensitive(false); // enabled once analysis completes
+        fn_header_row.append(&full_script_btn);
+
+        content.append(&fn_header_row);
 
         let func_list = ListBox::new();
         func_list.set_selection_mode(gtk4::SelectionMode::Single);
@@ -97,6 +108,14 @@ impl ExplorerPanel {
             });
         }
 
+        // ── "full script" button handler ──────────────────────────────────────
+        {
+            let bridge_ref = bridge.clone();
+            full_script_btn.connect_clicked(move |_| {
+                bridge_ref.select_all_functions();
+            });
+        }
+
         // ── Function row activation ───────────────────────────────────────────
         {
             let bridge_ref = bridge.clone();
@@ -109,11 +128,12 @@ impl ExplorerPanel {
 
         // ── Bridge subscriptions ──────────────────────────────────────────────
         {
-            let sections_box_ref = sections_box.clone();
-            let func_list_ref    = func_list.clone();
-            let fn_header_ref    = fn_header.clone();
-            let fn_count         = fn_count.clone();
-            let bridge_sub       = bridge.clone();
+            let sections_box_ref    = sections_box.clone();
+            let func_list_ref       = func_list.clone();
+            let fn_header_ref       = fn_header.clone();
+            let fn_count            = fn_count.clone();
+            let full_script_btn_ref = full_script_btn.clone();
+            let bridge_sub          = bridge.clone();
 
             bridge.subscribe(move |event| match event {
                 // Clear everything when a new file starts loading.
@@ -126,6 +146,7 @@ impl ExplorerPanel {
                     }
                     fn_count.set(0);
                     fn_header_ref.set_text("FUNCTIONS");
+                    full_script_btn_ref.set_sensitive(false);
                 }
 
                 // Populate the sections group.
@@ -152,6 +173,11 @@ impl ExplorerPanel {
                     let count = fn_count.get() + 1;
                     fn_count.set(count);
                     fn_header_ref.set_text(&format!("FUNCTIONS ({count})"));
+                }
+
+                // Enable "full script" once all functions are ready.
+                BridgeEvent::AnalysisDone => {
+                    full_script_btn_ref.set_sensitive(true);
                 }
 
                 _ => {}

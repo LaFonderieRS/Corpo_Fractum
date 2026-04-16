@@ -1,7 +1,7 @@
 //! x86-64 instruction lifter with register mapping and flag tracking.
 
 use rustdec_disasm::Instruction;
-use rustdec_ir::{BinOp, Expr, IrType, Stmt, Value};
+use rustdec_ir::{BinOp, CallTarget, Expr, IrType, Stmt, Value};
 use std::collections::HashMap;
 use tracing::{trace, warn};
 
@@ -259,6 +259,12 @@ fn lift_insn(
                 rhs: Expr::Opaque(format!("{} {}", insn.mnemonic, ops)) }]
         }
 
+        // ── Syscall ───────────────────────────────────────────────────────────
+        // Linux x86-64: nr in rax, args in rdi/rsi/rdx/r10/r8/r9 (r10 ≠ rcx!).
+        // We represent this as a special Call to "__syscall" so the codegen can
+        // look up the syscall name from the number and emit `syscall(SYS_xxx, ...)`.
+        "syscall" => lift_syscall(next_id, regs),
+
         // ── No-ops ────────────────────────────────────────────────────────────
         "nop" | "nopl" | "nopw"
         | "endbr64" | "endbr32" | "data16" => vec![Stmt::Nop],
@@ -360,6 +366,28 @@ fn lift_pop(dst: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt>
             rhs: Expr::BinOp { op: BinOp::Add, lhs: rsp_old,
                 rhs: Value::Const { val: 8, ty: IrType::UInt(64) } } },
     ]
+}
+
+fn lift_syscall(next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
+    // Arg order: nr=rax, then rdi, rsi, rdx, r10 (NOT rcx), r8, r9.
+    let nr  = reg_val("rax", regs);
+    let a0  = reg_val("rdi", regs);
+    let a1  = reg_val("rsi", regs);
+    let a2  = reg_val("rdx", regs);
+    let a3  = reg_val("r10", regs);
+    let a4  = reg_val("r8",  regs);
+    let a5  = reg_val("r9",  regs);
+    let (ret_id, _) = fresh(next_id, IrType::SInt(64));
+    regs.set("rax", ret_id);
+    vec![Stmt::Assign {
+        lhs: ret_id,
+        ty:  IrType::SInt(64),
+        rhs: Expr::Call {
+            target: CallTarget::Named("__syscall".to_string()),
+            args:   vec![nr, a0, a1, a2, a3, a4, a5],
+            ret_ty: IrType::SInt(64),
+        },
+    }]
 }
 
 fn lift_leave(next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {

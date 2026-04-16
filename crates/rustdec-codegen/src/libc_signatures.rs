@@ -151,6 +151,13 @@ fn build_table() -> HashMap<&'static str, FunctionSig> {
     m.insert("getenv",   sig!(ret: u8p(), params: [p!("name", u8p())]));
     m.insert("system",   sig!(ret: i32_(), params: [p!("cmd", u8p())]));
 
+    // ── Standard entry points ─────────────────────────────────────────────────
+    // Providing the canonical main signature lets the codegen emit
+    //   int main(int argc, char** argv)
+    // instead of the generic   uint64_t main(uint64_t a0, uint64_t a1).
+    let argv_ty = || Ptr(Box::new(u8p()));
+    m.insert("main", sig!(ret: SInt(32), params: [p!("argc", SInt(32)), p!("argv", argv_ty())]));
+
     // ── C++ runtime (demangled names already handled upstream) ────────────────
     m.insert("__stack_chk_fail",        sig!(ret: Void, params: []));
     m.insert("__cxa_allocate_exception",sig!(ret: vp(), params: [p!("size", sz())]));

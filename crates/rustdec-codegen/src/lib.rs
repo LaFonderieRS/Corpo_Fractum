@@ -6,6 +6,7 @@ pub mod c;
 pub mod cpp;
 pub mod libc_signatures;
 pub mod rust;
+pub mod syscalls;
 
 use rustdec_ir::{IrFunction, IrModule};
 use thiserror::Error;
