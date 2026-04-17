@@ -173,20 +173,21 @@ fn resolve_constants(func: &mut IrFunction, symbols: &SymbolMap) {
                                 }
                             }
                         }
-                        // Resolve Var args tracing to string addresses.
+                        // Resolve args (Var or Const) tracing to symbol addresses.
                         for arg in args.iter_mut() {
-                            if let Value::Var { id, .. } = arg {
-                                if let Some(&addr) = const_eval.get(id) {
-                                    if let Some(entry) = symbols.get(&addr) {
-                                        if entry.kind == SymbolMapKind::String {
-                                            trace!(id,
-                                                   addr = format_args!("{:#x}", addr),
-                                                   "resolve_constants: call arg → Const(addr)");
-                                            *arg = Value::Const {
-                                                val: addr,
-                                                ty:  IrType::Ptr(Box::new(IrType::UInt(8))),
-                                            };
-                                        }
+                            let resolved_addr = match arg {
+                                Value::Const { val, .. } => Some(*val),
+                                Value::Var   { id,  .. } => const_eval.get(id).copied(),
+                            };
+                            if let Some(addr) = resolved_addr {
+                                if let Some(entry) = symbols.get(&addr) {
+                                    if entry.kind == SymbolMapKind::String {
+                                        trace!(addr = format_args!("{:#x}", addr),
+                                               "resolve_constants: call arg → Const(addr)");
+                                        *arg = Value::Const {
+                                            val: addr,
+                                            ty:  IrType::Ptr(Box::new(IrType::UInt(8))),
+                                        };
                                     }
                                 }
                             }
@@ -220,13 +221,17 @@ fn symbol_expr(addr: u64, entry: &rustdec_loader::SymbolEntry) -> Expr {
 /// converges in 1–2 iterations.
 fn build_const_eval(func: &IrFunction) -> HashMap<u32, u64> {
     let mut eval: HashMap<u32, u64> = HashMap::new();
-    let node_count = func.cfg.node_count();
 
-    for _ in 0..16 {
+    // Use address-sorted block order (= entry-first topological approximation)
+    // so that a `mov rdi, addr` in block A propagates to a `call` in block B
+    // even when A and B are different basic blocks.
+    // We iterate up to 4 times to handle the rare case where blocks are not
+    // in strict dominator order (loops, back-edges).
+    let blocks = func.blocks_sorted();
+    for _ in 0..4 {
         let mut changed = false;
-        for ni in 0..node_count {
-            let idx = func.cfg.from_index(ni);
-            for stmt in &func.cfg[idx].stmts {
+        for bb in &blocks {
+            for stmt in &bb.stmts {
                 if let Stmt::Assign { lhs, rhs, .. } = stmt {
                     if eval.contains_key(lhs) { continue; }
                     if let Some(v) = try_eval_expr(rhs, &eval) {

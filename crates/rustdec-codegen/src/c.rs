@@ -125,7 +125,7 @@ impl CodegenBackend for CBackend {
 
     fn emit_type(&self, ty: &IrType) -> String {
         match ty {
-            IrType::UInt(8)             => "uint8_t".into(),
+            IrType::UInt(8)             => "char".into(),
             IrType::UInt(16)            => "uint16_t".into(),
             IrType::UInt(32)            => "uint32_t".into(),
             IrType::UInt(64)            => "uint64_t".into(),
@@ -511,7 +511,23 @@ impl CBackend {
 
             Expr::Cast { val, to } => {
                 let v = resolve(val, copies);
-                format!("({}){}", self.emit_type(to), display_value(v, copies, slots, reg_names))
+                let inner = display_value(v, copies, slots, reg_names);
+                // Suppress redundant casts between integer types of the same
+                // or compatible widths — (int)printf() → printf().
+                let suppress = match (v.ty(), to) {
+                    (IrType::SInt(a), IrType::SInt(b))   => a == b,
+                    (IrType::UInt(a), IrType::UInt(b))   => a == b,
+                    (IrType::SInt(a), IrType::UInt(b))   => a == b,
+                    (IrType::UInt(a), IrType::SInt(b))   => a == b,
+                    (IrType::UInt(64), IrType::SInt(32)) => true, // common retval pattern
+                    (IrType::SInt(32), IrType::UInt(64)) => true,
+                    _ => false,
+                };
+                if suppress {
+                    inner
+                } else {
+                    format!("({}){}", self.emit_type(to), inner)
+                }
             }
 
             Expr::Opaque(s) => format!("/* {s} */"),
