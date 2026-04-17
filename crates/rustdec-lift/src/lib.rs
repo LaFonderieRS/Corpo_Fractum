@@ -156,12 +156,24 @@ fn resolve_constants(func: &mut IrFunction, symbols: &SymbolMap) {
                             }
                         }
                     }
-                    // ── Call site: resolve Var args that trace to a symbol ─────
+                    // ── Call site ─────────────────────────────────────────────
                     //
-                    // `Value` cannot carry an `Expr::Symbol` so for string args
-                    // we replace with `Const(addr)` — the codegen checks the
-                    // string_table for every `Const` call arg.
-                    Expr::Call { args, .. } => {
+                    // 1. Resolve Direct(addr) target to Named(name) when the
+                    //    address maps to a known function symbol (PLT stub, etc.)
+                    // 2. Resolve Var args that trace to a string address.
+                    Expr::Call { target, args, .. } => {
+                        // Resolve call target address → symbol name.
+                        if let rustdec_ir::CallTarget::Direct(addr) = target {
+                            if let Some(entry) = symbols.get(addr) {
+                                if entry.kind == SymbolMapKind::Function {
+                                    trace!(addr = format_args!("{:#x}", addr),
+                                           name = %entry.name,
+                                           "resolve_constants: Direct → Named");
+                                    *target = rustdec_ir::CallTarget::Named(entry.name.clone());
+                                }
+                            }
+                        }
+                        // Resolve Var args tracing to string addresses.
                         for arg in args.iter_mut() {
                             if let Value::Var { id, .. } = arg {
                                 if let Some(&addr) = const_eval.get(id) {
