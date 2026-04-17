@@ -34,7 +34,41 @@ pub trait CodegenBackend {
     fn emit_type(&self, ty: &rustdec_ir::IrType) -> String;
 }
 
-/// Emit pseudo-code for every function in `module`.
+// ── CRT / runtime function filter ────────────────────────────────────────────
+
+/// Functions injected by the linker or C runtime that have no value for the
+/// reverse-engineer.  They are kept in the IR (for the call graph) but are
+/// silently skipped during code generation.
+const CRT_SKIP: &[&str] = &[
+    // ELF initialisation / finalisation stubs.
+    "_init",
+    "_fini",
+    "_start",
+    // glibc CRT helpers.
+    "__libc_start_main",
+    "__libc_csu_init",
+    "__libc_csu_fini",
+    // GCC TM / global-destructor helpers.
+    "__do_global_dtors_aux",
+    "deregister_tm_clones",
+    "register_tm_clones",
+    "frame_dummy",
+    // Dynamic linker relocations.
+    "_dl_relocate_static_pie",
+    // MSVC / MinGW equivalents.
+    "__DllMainCRTStartup",
+    "_DllMainCRTStartup",
+    "mainCRTStartup",
+    "WinMainCRTStartup",
+];
+
+/// Return `true` if `name` is a well-known CRT/runtime symbol that should be
+/// excluded from decompiled output.
+fn is_crt_function(name: &str) -> bool {
+    CRT_SKIP.contains(&name)
+}
+
+/// Emit pseudo-code for every non-CRT function in `module`.
 /// Returns `Vec<(function_name, source_code)>`.
 #[instrument(skip(module), fields(lang = ?lang, functions = module.functions.len()))]
 pub fn emit_module(
@@ -46,6 +80,11 @@ pub fn emit_module(
     let mut results = Vec::with_capacity(module.functions.len());
 
     for func in &module.functions {
+        if is_crt_function(&func.name) {
+            debug!(func = %func.name, "skipping CRT function");
+            continue;
+        }
+
         debug!(func = %func.name, blocks = func.cfg.node_count(), "emitting function");
 
         let src = match lang {
