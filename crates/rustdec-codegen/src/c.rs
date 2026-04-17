@@ -24,13 +24,12 @@ pub struct CBackend {
 
 impl CodegenBackend for CBackend {
     fn emit_function(&self, func: &IrFunction) -> CodegenResult<String> {
-        // If this function has a known libc / CRT signature and the inferred
-        // arity matches, use the known types and parameter names directly.
-        // This turns `uint64_t main(uint64_t a0, uint64_t a1)` into
-        // `int main(int argc, char** argv)` without any extra passes.
-        let known_sig = libc_signatures::lookup(&func.name)
-            .filter(|s| s.params.len() == func.params.len()
-                        || func.params.is_empty() && s.params.is_empty());
+        // If this function has a known libc / CRT signature, always prefer it
+        // over the inferred arity — the table is authoritative.
+        // This turns `uint64_t main(uint64_t a0, …)` into
+        // `int main(int argc, char** argv)` regardless of how many args
+        // were inferred.
+        let known_sig = libc_signatures::lookup(&func.name);
 
         let ret = if let Some(sig) = known_sig {
             self.emit_type(&sig.ret)

@@ -416,14 +416,36 @@ fn infer_abi_args(func: &mut IrFunction) {
         collect_reads_terminator(&func.cfg[idx].terminator, &mut live);
     }
 
+    // Collect all SSA ids that are *written* (assigned) in the function body.
+    // A seed id that only appears as a call arg but is never written was never
+    // intentionally set by the caller for this specific function — it is an
+    // ABI phantom, not a real argument.
+    let mut written: HashSet<u32> = HashSet::new();
+    for ni in 0..n {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            if let Stmt::Assign { lhs, .. } = stmt {
+                written.insert(*lhs);
+            }
+        }
+    }
+
     // Determine the arity and infer types for each arg register in ABI order.
+    // A register is a real argument if its seed id is:
+    //   a) read somewhere in the function (live), AND
+    //   b) NOT written before its first read (i.e. the seed value flows through).
+    // We stop at the first register that fails this test to preserve ABI order.
     let mut params: Vec<IrType> = Vec::new();
     for &reg in ARG_ORDER {
         let seed = match reg_to_seed.get(reg) {
             Some(&id) => id,
             None      => break,
         };
-        if !live.contains(&seed) { break; } // first unread reg → stop
+        // Seed not read at all → not an argument.
+        if !live.contains(&seed) { break; }
+        // Seed id is in written → the function assigns this reg before using
+        // the incoming value → not an argument register for this function.
+        if written.contains(&seed) { break; }
         params.push(infer_seed_type(func, seed));
     }
 

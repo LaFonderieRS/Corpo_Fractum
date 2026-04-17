@@ -73,6 +73,7 @@ pub fn load(elf: &Elf<'_>, bytes: &[u8]) -> LoadResult<BinaryObject> {
                 kind: SymbolKind::Import,
             })
         }))
+        .chain(extract_plt_symbols(elf, bytes))
         .collect();
 
     Ok(BinaryObject {
@@ -88,6 +89,56 @@ pub fn load(elf: &Elf<'_>, bytes: &[u8]) -> LoadResult<BinaryObject> {
     })
 }
 
+
+/// Extract PLT stub addresses by correlating `.plt` section with `.rela.plt`
+/// relocation entries and the dynamic symbol table.
+///
+/// Each PLT entry `puts@plt` at address `0x400370` becomes a symbol
+/// `Symbol { name: "puts", address: 0x400370, kind: Import }` so the
+/// `SymbolMap` can resolve `sub_400370` → `puts`.
+fn extract_plt_symbols(elf: &Elf<'_>, bytes: &[u8]) -> Vec<Symbol> {
+    let mut syms = Vec::new();
+
+    // Find the .plt section to know its base address and entry size.
+    let plt_section = elf.section_headers.iter()
+        .find(|sh| {
+            elf.shdr_strtab.get_at(sh.sh_name)
+                .map(|n| n == ".plt")
+                .unwrap_or(false)
+        });
+
+    let plt = match plt_section {
+        Some(s) => s,
+        None    => return syms,
+    };
+
+    // PLT entry size is 16 bytes on x86-64; first entry is the resolver stub.
+    let entry_size: u64 = if plt.sh_entsize > 0 { plt.sh_entsize } else { 16 };
+    let plt_base = plt.sh_addr;
+
+    // Walk .rela.plt relocations — each entry i maps to PLT entry (i+1).
+    for (rel_idx, rel) in elf.pltrelocs.iter().enumerate() {
+        let sym_idx = rel.r_sym;
+        let name = elf.dynstrtab
+            .get_at(elf.dynsyms.get(sym_idx).map(|s| s.st_name).unwrap_or(0))
+            .unwrap_or("")
+            .to_string();
+
+        if name.is_empty() { continue; }
+
+        // Entry 0 is the resolver; real stubs start at entry 1.
+        let stub_addr = plt_base + entry_size * (rel_idx as u64 + 1);
+
+        syms.push(Symbol {
+            name,
+            address: stub_addr,
+            size: entry_size,
+            kind: SymbolKind::Import,
+        });
+    }
+
+    syms
+}
 fn detect_arch(machine: u16) -> Arch {
     use goblin::elf::header::*;
     match machine {
