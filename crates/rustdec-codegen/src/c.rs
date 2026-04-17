@@ -131,7 +131,7 @@ impl CodegenBackend for CBackend {
             IrType::UInt(64)            => "uint64_t".into(),
             IrType::SInt(8)             => "int8_t".into(),
             IrType::SInt(16)            => "int16_t".into(),
-            IrType::SInt(32)            => "int32_t".into(),
+            IrType::SInt(32)            => "int".into(),
             IrType::SInt(64)            => "int64_t".into(),
             IrType::Float(32)           => "float".into(),
             IrType::Float(64)           => "double".into(),

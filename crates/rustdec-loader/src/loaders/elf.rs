@@ -126,6 +126,9 @@ fn extract_plt_symbols(elf: &Elf<'_>, bytes: &[u8]) -> Vec<Symbol> {
 
         if name.is_empty() { continue; }
 
+        // Strip version suffix e.g. "printf@GLIBC_2.2.5" → "printf".
+        let name = name.split('@').next().unwrap_or(&name).to_string();
+
         // Entry 0 is the resolver; real stubs start at entry 1.
         let stub_addr = plt_base + entry_size * (rel_idx as u64 + 1);
 

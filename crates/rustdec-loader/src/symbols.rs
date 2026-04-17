@@ -79,6 +79,10 @@ pub fn build_symbol_map(obj: &BinaryObject, strings: &StringTable) -> SymbolMap 
     // ── 3. Symbol table ───────────────────────────────────────────────────────
     for sym in &obj.symbols {
         if sym.name.is_empty() { continue; }
+        // Skip symbols at address 0 — these are unresolved dynamic imports
+        // (st_value == 0 in the dynsym table before relocation).  The real
+        // PLT stubs added by extract_plt_symbols carry the correct addresses.
+        if sym.address == 0 { continue; }
         let kind = match sym.kind {
             LoaderSymbolKind::Function
             | LoaderSymbolKind::Import
