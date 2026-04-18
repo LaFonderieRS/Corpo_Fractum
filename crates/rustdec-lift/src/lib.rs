@@ -6,7 +6,7 @@
 pub mod frame;
 pub mod x86;
 
-use petgraph::visit::NodeIndexable;
+use petgraph::visit::{NodeIndexable, IntoNodeIdentifiers};
 use rustdec_disasm::Instruction;
 use rustdec_ir::{BinOp, Expr, IrFunction, IrType, SymbolKind, Stmt, Terminator, Value};
 use rustdec_loader::{SymbolMap, SymbolMapKind};
@@ -118,6 +118,28 @@ fn resolve_constants(func: &mut IrFunction, symbols: &SymbolMap) {
     if symbols.is_empty() { return; }
 
     let const_eval = build_const_eval(func);
+
+    // Pre-build a map: lhs_id → inner_id for every Cast(Var(inner)) assignment.
+    // Used to resolve zero-extend chains (edi → rdi) when const_eval alone
+    // cannot follow the Cast because of block ordering.
+    let cast_map: HashMap<u32, u32> = {
+        let mut m = HashMap::new();
+        let n = func.cfg.node_count();
+        for ni in 0..n {
+            let idx = func.cfg.from_index(ni);
+            for stmt in &func.cfg[idx].stmts {
+                if let Stmt::Assign {
+                    lhs,
+                    rhs: Expr::Cast { val: Value::Var { id: inner, .. }, .. },
+                    ..
+                } = stmt {
+                    m.insert(*lhs, *inner);
+                }
+            }
+        }
+        m
+    };
+
     let node_count = func.cfg.node_count();
 
     for ni in 0..node_count {
@@ -177,7 +199,19 @@ fn resolve_constants(func: &mut IrFunction, symbols: &SymbolMap) {
                         for arg in args.iter_mut() {
                             let resolved_addr = match arg {
                                 Value::Const { val, .. } => Some(*val),
-                                Value::Var   { id,  .. } => const_eval.get(id).copied(),
+                                Value::Var   { id,  .. } => {
+                                    // Direct lookup first.
+                                    let direct = const_eval.get(id).copied();
+                                    if direct.is_some() {
+                                        direct
+                                    } else {
+                                        // The arg may be a zero-extended 64-bit
+                                        // version of a 32-bit register (edi → rdi).
+                                        // Look up one level of Cast via the pre-built map.
+                                        cast_map.get(id)
+                                            .and_then(|inner| const_eval.get(inner).copied())
+                                    }
+                                }
                             };
                             if let Some(addr) = resolved_addr {
                                 if let Some(entry) = symbols.get(&addr) {
@@ -228,7 +262,9 @@ fn build_const_eval(func: &IrFunction) -> HashMap<u32, u64> {
     // We iterate up to 4 times to handle the rare case where blocks are not
     // in strict dominator order (loops, back-edges).
     let blocks = func.blocks_sorted();
-    for _ in 0..4 {
+    // Up to 8 passes to handle multi-hop chains:
+    // Const(0x401180) → new_id [Cast UInt32] → ext_id [Cast UInt64] → call arg
+    for _ in 0..8 {
         let mut changed = false;
         for bb in &blocks {
             for stmt in &bb.stmts {
