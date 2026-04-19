@@ -93,6 +93,23 @@ impl CodegenBackend for CBackend {
         out.push_str(&format!("// RustDec decompilation — {}\n", func.name));
         out.push_str(&format!("{ret} {}({params}) {{\n", sanitise_name(&func.name)));
 
+        // ── Refine call return types using known signatures ──────────────────
+        // When a function has a known libc signature, the lhs of its call
+        // was declared as UInt(64) by the lifter.  Update var_decls to use
+        // the actual return type so `int v20` is emitted instead of
+        // `uint64_t v20`.
+        for bb in &blocks {
+            for stmt in &bb.stmts {
+                if let Stmt::Assign { lhs, rhs: Expr::Call { target: CallTarget::Named(n), .. }, .. } = stmt {
+                    if let Some(sig) = libc_signatures::lookup(n) {
+                        if sig.ret != IrType::Void && sig.ret != IrType::Unknown {
+                            var_decls.insert(*lhs, sig.ret.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Emit variable declarations (hoisted) ──────────────────────────────
         let mut decl_lines: Vec<String> = var_decls
             .iter()
@@ -240,8 +257,17 @@ impl CBackend {
             }
 
             SNode::Seq(nodes) => {
+                let before = out.len();
                 for n in nodes {
+                    let len_before = out.len();
                     self.emit_node(n, sfunc, copies, written, slots, reg_names, out, depth);
+                    // Stop after a node that emitted a return statement —
+                    // any subsequent nodes in this Seq are unreachable.
+                    let added = &out[len_before..];
+                    if added.contains("return") {
+                        break;
+                    }
+                    let _ = before;
                 }
             }
 

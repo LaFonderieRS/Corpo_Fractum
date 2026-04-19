@@ -99,26 +99,78 @@ pub fn load(elf: &Elf<'_>, bytes: &[u8]) -> LoadResult<BinaryObject> {
 fn extract_plt_symbols(elf: &Elf<'_>, bytes: &[u8]) -> Vec<Symbol> {
     let mut syms = Vec::new();
 
-    // Find the .plt section to know its base address and entry size.
-    let plt_section = elf.section_headers.iter()
-        .find(|sh| {
+    // Find the PLT section. Modern GCC with IBT/CET generates `.plt.sec`
+    // (indirect branch tracking) where the actual stubs live, while the
+    // old `.plt` only contains the resolver and GOT trampolines.
+    // We prefer .plt.sec > .plt in that order.
+    let plt_names = [".plt.sec", ".plt"];
+    let plt_section = plt_names.iter().find_map(|&wanted| {
+        elf.section_headers.iter().find(|sh| {
             elf.shdr_strtab.get_at(sh.sh_name)
-                .map(|n| n == ".plt")
+                .map(|n| n == wanted)
                 .unwrap_or(false)
-        });
+        })
+    });
 
     let plt = match plt_section {
         Some(s) => s,
         None    => return syms,
     };
 
-    // PLT entry size is 16 bytes on x86-64; first entry is the resolver stub.
+    // Entry size: use sh_entsize when set, otherwise 16 (standard x86-64).
     let entry_size: u64 = if plt.sh_entsize > 0 { plt.sh_entsize } else { 16 };
     let plt_base = plt.sh_addr;
 
-    // Walk .rela.plt relocations — each entry i maps to PLT entry (i+1).
-    for (rel_idx, rel) in elf.pltrelocs.iter().enumerate() {
-        let sym_idx = rel.r_sym;
+    // Determine stub index offset:
+    // - .plt.sec: stubs start at index 0 (no resolver stub)
+    // - classic .plt: entry 0 is the resolver, stubs start at index 1
+    let is_plt_sec = elf.shdr_strtab
+        .get_at(plt.sh_name)
+        .map(|n| n == ".plt.sec")
+        .unwrap_or(false);
+    let stub_offset: u64 = if is_plt_sec { 0 } else { 1 };
+
+    // Find .rela.plt section and parse it directly from bytes.
+    // We avoid relying on elf.pltrelocs because goblin may not populate it
+    // correctly for binaries with IBT (.plt.sec) or unusual section layouts.
+    let rela_plt = elf.section_headers.iter().find(|sh| {
+        elf.shdr_strtab.get_at(sh.sh_name)
+            .map(|n| n == ".rela.plt")
+            .unwrap_or(false)
+    });
+
+    let rela_plt = match rela_plt {
+        Some(s) => s,
+        None    => {
+            // Fall back to goblin's pltrelocs if the section isn't found.
+            for (rel_idx, rel) in elf.pltrelocs.iter().enumerate() {
+                let sym_idx = rel.r_sym;
+                let name = elf.dynstrtab
+                    .get_at(elf.dynsyms.get(sym_idx).map(|s| s.st_name).unwrap_or(0))
+                    .unwrap_or("")
+                    .to_string();
+                if name.is_empty() { continue; }
+                let name = name.split('@').next().unwrap_or(&name).to_string();
+                let stub_addr = plt_base + entry_size * (rel_idx as u64 + stub_offset);
+                syms.push(Symbol { name, address: stub_addr, size: entry_size, kind: SymbolKind::Import });
+            }
+            return syms;
+        }
+    };
+
+    // Each Rela64 entry is 24 bytes: r_offset(8) + r_info(8) + r_addend(8).
+    // r_sym = r_info >> 32.
+    let rela_entsize = if rela_plt.sh_entsize > 0 { rela_plt.sh_entsize as usize } else { 24 };
+    let rela_offset  = rela_plt.sh_offset as usize;
+    let rela_count   = (rela_plt.sh_size as usize) / rela_entsize;
+
+    for rel_idx in 0..rela_count {
+        let off = rela_offset + rel_idx * rela_entsize;
+        if off + 16 > bytes.len() { break; }
+
+        let r_info = u64::from_le_bytes(bytes[off+8..off+16].try_into().unwrap_or([0;8]));
+        let sym_idx = (r_info >> 32) as usize;
+
         let name = elf.dynstrtab
             .get_at(elf.dynsyms.get(sym_idx).map(|s| s.st_name).unwrap_or(0))
             .unwrap_or("")
@@ -126,11 +178,10 @@ fn extract_plt_symbols(elf: &Elf<'_>, bytes: &[u8]) -> Vec<Symbol> {
 
         if name.is_empty() { continue; }
 
-        // Strip version suffix e.g. "printf@GLIBC_2.2.5" → "printf".
+        // Strip version suffix e.g. "puts@GLIBC_2.2.5" → "puts".
         let name = name.split('@').next().unwrap_or(&name).to_string();
 
-        // Entry 0 is the resolver; real stubs start at entry 1.
-        let stub_addr = plt_base + entry_size * (rel_idx as u64 + 1);
+        let stub_addr = plt_base + entry_size * (rel_idx as u64 + stub_offset);
 
         syms.push(Symbol {
             name,
