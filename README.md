@@ -110,6 +110,67 @@ cargo test -p rustdec-disasm     # disassembler only
 
 ---
 
+## Usage
+
+### Load a binary
+
+```rust
+use rustdec_loader::load_file;
+
+let obj = load_file("/path/to/binary")?;
+println!("format={:?}  arch={}  64-bit={}", obj.format, obj.arch, obj.is_64bit);
+println!("{} sections, {} symbols", obj.sections.len(), obj.symbols.len());
+```
+
+### Run the full analysis pipeline
+
+```rust
+use rustdec_loader::load_file;
+use rustdec_analysis::analyse;
+
+let obj = load_file("/path/to/binary")?;
+let module = analyse(&obj)?;
+println!("{} functions lifted", module.functions.len());
+```
+
+### Emit pseudo-code
+
+```rust
+use rustdec_codegen::{emit_module, Language};
+
+// module from analyse() above
+let output = emit_module(&module, Language::C)?;
+for (name, src) in &output {
+    println!("// ── {name} ──\n{src}");
+}
+```
+
+### Work with the IR directly
+
+```rust
+use rustdec_ir::{IrType, Value, Expr, BinOp};
+
+// Inspect a specific function
+let func = &module.functions[0];
+println!("fn {}  @ {:#x}  frame={} bytes", func.name, func.entry_addr, func.frame_size);
+
+for block in func.blocks_sorted() {
+    println!("  bb{} [{:#x}..{:#x}]", block.id, block.start_addr, block.end_addr);
+    for stmt in &block.stmts {
+        println!("    {stmt:?}");
+    }
+    println!("    → {:?}", block.terminator);
+}
+```
+
+### Log filtering
+
+```bash
+RUSTDEC_LOG=rustdec_analysis=debug,info ./target/release/corpo_fractum
+```
+
+---
+
 ## Workspace layout
 
 ```
