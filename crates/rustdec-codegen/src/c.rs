@@ -132,7 +132,7 @@ impl CodegenBackend for CBackend {
         // instead of leaking raw register names into the C output.
         const PARAM_REGS: &[&str] = &["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
         let param_names: Vec<String> = if let Some(sig) = known_sig {
-            sig.params.iter().map(|p| p.name.clone()).collect()
+            sig.params.iter().map(|p| p.name.to_string()).collect()
         } else {
             (0..func.params.len()).map(|i| format!("a{i}")).collect()
         };

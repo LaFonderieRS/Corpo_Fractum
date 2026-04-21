@@ -82,6 +82,18 @@ pub fn lift_function(
     // Frame analysis — runs last so it sees fully annotated stmts.
     frame::analyse_frame(func);
 
+    // Eliminate trivial slot spill/reload pairs produced by -O0 arg spills.
+    copy_propagate_slots(func);
+
+    // Second DCE round: remove assignments made dead by copy-propagation.
+    eliminate_dead_assigns(func);
+
+    // Remove -fstack-protector canary epilogue (call to __stack_chk_fail).
+    frame::eliminate_canary(func);
+
+    // Third DCE round: remove comparison chain made dead by canary removal.
+    eliminate_dead_assigns(func);
+
     // ABI arity inference — determines func.params from register usage.
     infer_abi_args(func);
 
@@ -530,4 +542,152 @@ fn infer_seed_type(func: &IrFunction, seed: u32) -> IrType {
         }
     }
     IrType::UInt(64)
+}
+
+// ── Slot copy-propagation ─────────────────────────────────────────────────────
+
+/// Eliminate trivial stack-slot spill/reload pairs produced by -O0 compilation.
+///
+/// A slot written exactly once (`Store(slot, v)`) and read exactly once
+/// (`x = Load(slot)`) is a trivial copy.  After this pass:
+/// - The spill store is replaced by `Nop`.
+/// - Every use of the reload result `x` is replaced by `v` directly.
+/// - The now-dead `x = v` assignment is removed by the subsequent DCE round.
+///
+/// The substitution map is normalised (chains flattened) so that
+/// `a → b → c` becomes `a → c`, covering the rare case where a spilled
+/// value was itself loaded from another eligible slot.
+fn copy_propagate_slots(func: &mut IrFunction) {
+    use frame::is_slot_id;
+
+    let node_count = func.cfg.node_count();
+
+    // ── Phase 1: count stores and loads per slot pointer id ──────────────────
+    let mut store_count: HashMap<u32, u32>   = HashMap::new();
+    let mut store_vals:  HashMap<u32, Value> = HashMap::new();
+    let mut load_count:  HashMap<u32, u32>   = HashMap::new();
+
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            match stmt {
+                Stmt::Store { ptr: Value::Var { id, .. }, val }
+                    if is_slot_id(*id) =>
+                {
+                    *store_count.entry(*id).or_insert(0) += 1;
+                    store_vals.entry(*id).or_insert_with(|| val.clone());
+                }
+                Stmt::Assign {
+                    rhs: Expr::Load { ptr: Value::Var { id, .. }, .. }, ..
+                } if is_slot_id(*id) => {
+                    *load_count.entry(*id).or_insert(0) += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Eligible: written exactly once AND read exactly once.
+    let eligible: HashSet<u32> = store_count
+        .iter()
+        .filter(|(&id, &sc)| sc == 1 && load_count.get(&id).copied().unwrap_or(0) == 1)
+        .map(|(&id, _)| id)
+        .collect();
+
+    if eligible.is_empty() { return; }
+
+    // ── Phase 2: build substitution map: reload_lhs → stored value ───────────
+    let mut sub_map: HashMap<u32, Value> = HashMap::new();
+
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            if let Stmt::Assign {
+                lhs,
+                rhs: Expr::Load { ptr: Value::Var { id, .. }, .. },
+                ..
+            } = stmt {
+                if eligible.contains(id) {
+                    sub_map.insert(*lhs, store_vals[id].clone());
+                }
+            }
+        }
+    }
+
+    // Normalise: flatten chains (a→b→c becomes a→c) so a single substitution
+    // pass handles transitive copies without a second round.
+    for _ in 0..16 {
+        let mut changed = false;
+        let keys: Vec<u32> = sub_map.keys().copied().collect();
+        for k in keys {
+            let deeper = match sub_map.get(&k) {
+                Some(Value::Var { id, .. }) => sub_map.get(id).cloned(),
+                _ => None,
+            };
+            if let Some(v) = deeper {
+                sub_map.insert(k, v);
+                changed = true;
+            }
+        }
+        if !changed { break; }
+    }
+
+    // ── Phase 3: rewrite — nop spills, fold reloads, substitute all uses ─────
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        let mut stmts = std::mem::take(&mut func.cfg[idx].stmts);
+        for stmt in &mut stmts {
+            match stmt {
+                Stmt::Store { ptr: Value::Var { id, .. }, .. } if eligible.contains(id) => {
+                    *stmt = Stmt::Nop;
+                }
+                Stmt::Assign { rhs, .. } => {
+                    // Reload from eligible slot → replace with the stored value.
+                    let replacement = if let Expr::Load { ptr: Value::Var { id, .. }, .. } = &*rhs {
+                        eligible.contains(id).then(|| store_vals[id].clone())
+                    } else {
+                        None
+                    };
+                    if let Some(val) = replacement {
+                        *rhs = Expr::Value(val);
+                    }
+                    // Substitute propagated variables (handles chaining and other uses).
+                    subst_expr(rhs, &sub_map);
+                }
+                Stmt::Store { ptr, val } => {
+                    subst_value(ptr, &sub_map);
+                    subst_value(val, &sub_map);
+                }
+                Stmt::Nop => {}
+            }
+        }
+        func.cfg[idx].stmts = stmts;
+
+        match &mut func.cfg[idx].terminator {
+            Terminator::Return(Some(v))     => subst_value(v, &sub_map),
+            Terminator::Branch { cond, .. } => subst_value(cond, &sub_map),
+            _ => {}
+        }
+    }
+
+    trace!(func       = %func.name,
+           propagated = sub_map.len(),
+           "slot copy-propagation complete");
+}
+
+fn subst_value(v: &mut Value, map: &HashMap<u32, Value>) {
+    if let Value::Var { id, .. } = v {
+        if let Some(r) = map.get(id) { *v = r.clone(); }
+    }
+}
+
+fn subst_expr(expr: &mut Expr, map: &HashMap<u32, Value>) {
+    match expr {
+        Expr::Value(v)               => subst_value(v, map),
+        Expr::BinOp { lhs, rhs, .. } => { subst_value(lhs, map); subst_value(rhs, map); }
+        Expr::Load  { ptr, .. }      => subst_value(ptr, map),
+        Expr::Cast  { val, .. }      => subst_value(val, map),
+        Expr::Call  { args, .. }     => args.iter_mut().for_each(|a| subst_value(a, map)),
+        Expr::Symbol { .. } | Expr::Opaque(_) => {}
+    }
 }

@@ -44,8 +44,8 @@
 //! - Type inference is heuristic: slot type defaults to `UInt(64)` unless the
 //!   access size can be read from the `IrType` of the `Load`/`Store`.
 
-use rustdec_ir::{BinOp, Expr, IrFunction, IrType, Stmt, Terminator, Value};
-use std::collections::HashMap;
+use rustdec_ir::{BinOp, CallTarget, Expr, IrFunction, IrType, Stmt, Terminator, Value};
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace};
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -643,6 +643,92 @@ pub fn slot_id_to_offset(id: u32) -> i64 {
 /// Return true if this id is a slot var.
 pub fn is_slot_id(id: u32) -> bool {
     id >= 10_000 && id < 20_000
+}
+
+// ── Stack canary elimination ──────────────────────────────────────────────────
+
+/// Remove the `-fstack-protector` canary epilogue from `func`.
+///
+/// After `copy_propagate_slots`, the canary slot itself is already gone.
+/// What remains is:
+/// 1. A block that calls `__stack_chk_fail` (the fail path).
+/// 2. A predecessor block whose `Branch` terminator has one arm pointing at
+///    that block and the other arm continuing to the normal return path.
+///
+/// This pass:
+/// - Nops all statements in the `__stack_chk_fail` block and marks it
+///   `Unreachable`.
+/// - Converts the predecessor's `Branch` terminator to an unconditional
+///   `Jump` to the normal successor.
+/// - Removes the now-dead CFG edge so the structure analyser does not emit
+///   a spurious `if` branch.
+///
+/// DCE (run by the caller after this pass) then cleans up the comparison
+/// and flag assignments that became dead when the conditional was removed.
+pub fn eliminate_canary(func: &mut IrFunction) {
+    use petgraph::visit::NodeIndexable;
+
+    let node_count = func.cfg.node_count();
+
+    // ── Phase 1: find blocks that call __stack_chk_fail ──────────────────────
+    let mut fail_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            if let Stmt::Assign {
+                rhs: Expr::Call { target: CallTarget::Named(name), .. }, ..
+            } = stmt {
+                if name == "__stack_chk_fail" {
+                    fail_nodes.insert(idx);
+                    break;
+                }
+            }
+        }
+    }
+
+    if fail_nodes.is_empty() { return; }
+
+    // ── Phase 2: collect (predecessor, fail_node) pairs to fix ───────────────
+    // Collect first to avoid borrow conflicts during mutation.
+    let mut patches: Vec<(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex)> = Vec::new();
+    for &fail_ni in &fail_nodes {
+        let preds: Vec<_> = func.cfg
+            .neighbors_directed(fail_ni, petgraph::Direction::Incoming)
+            .collect();
+        for pred_ni in preds {
+            patches.push((pred_ni, fail_ni));
+        }
+    }
+
+    // ── Phase 3: fix predecessor branch → unconditional jump ─────────────────
+    for (pred_ni, fail_ni) in patches {
+        let fail_block_id = func.cfg[fail_ni].id;
+
+        // Collect the non-fail successor id before mutating the terminator.
+        let other_bb = match &func.cfg[pred_ni].terminator {
+            Terminator::Branch { _true_bb, _false_bb, .. } => {
+                if *_true_bb == fail_block_id { *_false_bb } else { *_true_bb }
+            }
+            _ => continue, // unexpected — leave as-is
+        };
+
+        func.cfg[pred_ni].terminator = Terminator::Jump(other_bb);
+
+        // Remove the CFG edge so the structure analyser sees the updated graph.
+        if let Some(ei) = func.cfg.find_edge(pred_ni, fail_ni) {
+            func.cfg.remove_edge(ei);
+        }
+    }
+
+    // ── Phase 4: nop fail blocks ──────────────────────────────────────────────
+    for fail_ni in fail_nodes {
+        for stmt in &mut func.cfg[fail_ni].stmts {
+            *stmt = Stmt::Nop;
+        }
+        func.cfg[fail_ni].terminator = Terminator::Unreachable;
+    }
+
+    debug!(func = %func.name, "stack canary eliminated");
 }
 
 // ── Legacy public helpers (kept for codegen compatibility) ────────────────────
