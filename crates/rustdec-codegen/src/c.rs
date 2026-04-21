@@ -116,7 +116,6 @@ impl CodegenBackend for CBackend {
             .filter(|(id, _)| {
                 !suppressed.contains(id)
                     && !is_slot_id(**id)
-                    && !func.reg_names.contains_key(id)
             })
             .map(|(id, ty)| format!("  {} v{id};", self.emit_type(ty)))
             .collect();
@@ -126,12 +125,31 @@ impl CodegenBackend for CBackend {
             out.push('\n');
         }
 
+        // ── Build codegen register-name map ──────────────────────────────────
+        // Only ABI parameter registers (rdi, rsi, rdx, rcx, r8, r9) are mapped
+        // to their C parameter names.  Non-parameter registers (rax, rsp, rbp,
+        // etc.) are excluded so they fall back to v{id} in display_value
+        // instead of leaking raw register names into the C output.
+        const PARAM_REGS: &[&str] = &["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+        let param_names: Vec<String> = if let Some(sig) = known_sig {
+            sig.params.iter().map(|p| p.name.clone()).collect()
+        } else {
+            (0..func.params.len()).map(|i| format!("a{i}")).collect()
+        };
+        let mut codegen_reg_names: HashMap<u32, String> = HashMap::new();
+        for (id, reg) in &func.reg_names {
+            if let Some(idx) = PARAM_REGS.iter().position(|r| *r == reg.as_str()) {
+                if let Some(pname) = param_names.get(idx) {
+                    codegen_reg_names.insert(*id, pname.clone());
+                }
+            }
+        }
+
         // ── Emit structured body ──────────────────────────────────────────────
         let structured = structure_function(func);
         let slots     = &func.slot_table;
-        let reg_names = &func.reg_names;
         self.emit_node(&structured.root, &structured, &copy_table,
-                       &written_vars, slots, reg_names, &mut out, 1);
+                       &written_vars, slots, &codegen_reg_names, &mut out, 1);
 
         out.push_str("}\n");
         debug!(func = %func.name, lines = out.lines().count(),
