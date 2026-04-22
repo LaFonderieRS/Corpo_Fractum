@@ -292,13 +292,25 @@ impl IrFunction {
 
     /// Look up the stack slot for a given rbp offset, or create a new one.
     ///
-    /// `ty` is used only when creating a new slot — existing slots keep their
-    /// previously inferred type.
+    /// If the slot already exists and its type is `Unknown` or the generic
+    /// `UInt(64)` fallback, it is refined to `ty` (the actual access type).
+    /// For `Local`-origin slots, `UInt(32)` is promoted to `SInt(32)` because
+    /// 32-bit locals are almost always C `int`.
     pub fn get_or_insert_slot(&mut self, rbp_offset: i64, ty: IrType) -> &mut StackSlot {
-        self.slot_table.entry(rbp_offset).or_insert_with(|| {
+        let slot = self.slot_table.entry(rbp_offset).or_insert_with(|| {
             let (name, origin) = classify_slot(rbp_offset);
-            StackSlot { rbp_offset, ty, name, origin }
-        })
+            StackSlot { rbp_offset, ty: IrType::Unknown, name, origin }
+        });
+        if slot.ty == IrType::Unknown
+            || (slot.ty == IrType::UInt(64) && ty != IrType::Unknown)
+        {
+            slot.ty = if matches!(slot.origin, SlotOrigin::Local) && ty == IrType::UInt(32) {
+                IrType::SInt(32)
+            } else {
+                ty
+            };
+        }
+        slot
     }
 
     /// Allocate a fresh SSA variable id.

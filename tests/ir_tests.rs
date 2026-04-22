@@ -167,11 +167,15 @@ fn get_or_insert_slot_stack_args() {
 #[test]
 fn get_or_insert_slot_type_is_stable_on_repeat_call() {
     let mut f = IrFunction::new("test", 0);
+    // UInt(64) is the generic fallback — a more specific type refines it.
     f.get_or_insert_slot(-8, IrType::UInt(64));
-    // Second call with a different type must NOT overwrite the first type.
     let s = f.get_or_insert_slot(-8, IrType::SInt(32));
-    assert_eq!(s.ty, IrType::UInt(64),
-        "slot type must remain unchanged on second get_or_insert call");
+    assert_eq!(s.ty, IrType::SInt(32),
+        "UInt(64) placeholder must be refined by a more specific type");
+    // Once set to a non-generic type, it must not be overwritten.
+    let s2 = f.get_or_insert_slot(-8, IrType::UInt(64));
+    assert_eq!(s2.ty, IrType::SInt(32),
+        "specific type must not regress back to UInt(64)");
 }
 
 #[test]

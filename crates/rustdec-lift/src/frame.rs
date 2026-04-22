@@ -549,13 +549,15 @@ fn rewrite_stmt(
 ) -> Stmt {
     match stmt {
         Stmt::Store { ptr, val } => {
-            let (new_ptr, _) = resolve_frame_ptr(ptr, func, rbp_ids, rsp_ids, def_map);
+            let access_ty = val.ty().clone();
+            let (new_ptr, _) = resolve_frame_ptr(ptr, func, rbp_ids, rsp_ids, def_map, access_ty);
             Stmt::Store { ptr: new_ptr, val }
         }
         Stmt::Assign { lhs, ty, rhs } => {
             let new_rhs = match rhs {
                 Expr::Load { ptr, ty: load_ty } => {
-                    let (new_ptr, slot_ty) = resolve_frame_ptr(ptr, func, rbp_ids, rsp_ids, def_map);
+                    let (new_ptr, slot_ty) = resolve_frame_ptr(
+                        ptr, func, rbp_ids, rsp_ids, def_map, load_ty.clone());
                     let effective_ty = if slot_ty != IrType::Unknown { slot_ty } else { load_ty };
                     Expr::Load { ptr: new_ptr, ty: effective_ty }
                 }
@@ -569,47 +571,52 @@ fn rewrite_stmt(
 
 /// Try to resolve `ptr` to a named frame slot.
 ///
+/// `access_ty` is the type of the actual memory access — `val.ty()` for a
+/// Store, `load_ty` for a Load.  It is passed to `get_or_insert_slot` so the
+/// slot table accumulates the most precise type seen across all accesses.
+///
 /// Resolution order:
 /// 1. rbp ± K → local / arg slot
 /// 2. rsp ± K → converted to rbp-relative using `frame_size`
 /// 3. rsp ± K with `frame_size == 0` → red-zone local (leaf function)
 fn resolve_frame_ptr(
-    ptr:     Value,
-    func:    &mut IrFunction,
-    rbp_ids: &[u32],
-    rsp_ids: &[u32],
-    def_map: &HashMap<u32, Expr>,
+    ptr:       Value,
+    func:      &mut IrFunction,
+    rbp_ids:   &[u32],
+    rsp_ids:   &[u32],
+    def_map:   &HashMap<u32, Expr>,
+    access_ty: IrType,
 ) -> (Value, IrType) {
     // ── rbp-relative ─────────────────────────────────────────────────────────
     if let Some(rbp_off) = resolve_offset(&ptr, rbp_ids, def_map) {
-        let ty   = access_type_from_ptr(&ptr);
-        let slot = func.get_or_insert_slot(rbp_off, ty.clone());
-        let name = slot.name.clone();
+        let slot    = func.get_or_insert_slot(rbp_off, access_ty);
+        let slot_ty = slot.ty.clone();
+        let name    = slot.name.clone();
         trace!(func = %func.name, slot = %name, offset = rbp_off,
                "frame slot resolved (rbp-relative)");
-        return (slot_ptr_val(rbp_off), ty);
+        return (slot_ptr_val(rbp_off), slot_ty);
     }
 
     // ── rsp-relative ─────────────────────────────────────────────────────────
     if let Some(rsp_off) = resolve_offset(&ptr, rsp_ids, def_map) {
-        let ty = access_type_from_ptr(&ptr);
-
         if func.frame_size > 0 {
             // Standard frame: rsp = rbp - frame_size → [rsp + K] = [rbp - (frame_size - K)]
             let rbp_off = -(func.frame_size as i64) + rsp_off;
-            let slot = func.get_or_insert_slot(rbp_off, ty.clone());
-            let name = slot.name.clone();
+            let slot    = func.get_or_insert_slot(rbp_off, access_ty);
+            let slot_ty = slot.ty.clone();
+            let name    = slot.name.clone();
             trace!(func = %func.name, slot = %name,
                    rsp_off, rbp_off, "rsp-relative slot → rbp-relative");
-            return (slot_ptr_val(rbp_off), ty);
+            return (slot_ptr_val(rbp_off), slot_ty);
         } else if rsp_off < 0 {
             // Red zone: leaf function, no sub rsp.  rsp is the frame base.
             // [rsp - K] is equivalent to [entry_rsp - K] = local slot.
-            let slot = func.get_or_insert_slot(rsp_off, ty.clone());
-            let name = slot.name.clone();
+            let slot    = func.get_or_insert_slot(rsp_off, access_ty);
+            let slot_ty = slot.ty.clone();
+            let name    = slot.name.clone();
             trace!(func = %func.name, slot = %name,
                    rsp_off, "red-zone slot (leaf function)");
-            return (slot_ptr_val(rsp_off), ty);
+            return (slot_ptr_val(rsp_off), slot_ty);
         }
     }
 
@@ -617,14 +624,6 @@ fn resolve_frame_ptr(
 }
 
 // ── Offset helpers ────────────────────────────────────────────────────────────
-
-/// Try to read the pointee type from a pointer value's type annotation.
-fn access_type_from_ptr(ptr: &Value) -> IrType {
-    match ptr.ty() {
-        IrType::Ptr(inner) => *inner.clone(),
-        _ => IrType::UInt(64),
-    }
-}
 
 /// Build a stable symbolic `Value` for a slot at `rbp_offset`.
 ///

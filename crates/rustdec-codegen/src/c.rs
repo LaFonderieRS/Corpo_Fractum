@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use rustdec_analysis::{structure_function, CondExpr, SNode};
 use rustdec_lift::frame::{is_slot_id, slot_id_to_offset};
-use rustdec_ir::{BinOp, BasicBlock, CallTarget, Expr, IrFunction, IrType, SymbolKind, Stmt, Terminator, Value};
+use rustdec_ir::{BinOp, BasicBlock, CallTarget, Expr, IrFunction, IrType, SlotOrigin, SymbolKind, Stmt, Terminator, Value};
 use tracing::{debug, trace, warn};
 
 use crate::{CodegenBackend, CodegenResult, libc_signatures, syscalls};
@@ -108,6 +108,19 @@ impl CodegenBackend for CBackend {
                     }
                 }
             }
+        }
+
+        // ── Emit slot declarations (local variables, hoisted) ─────────────────
+        let mut slot_decls: Vec<String> = func.slot_table
+            .values()
+            .filter(|s| matches!(s.origin, SlotOrigin::Local))
+            .filter(|s| !matches!(s.ty, IrType::Unknown))
+            .map(|s| format!("  {} {};", self.emit_type(&s.ty), s.name))
+            .collect();
+        slot_decls.sort();
+        if !slot_decls.is_empty() {
+            for line in &slot_decls { out.push_str(line); out.push('\n'); }
+            out.push('\n');
         }
 
         // ── Emit variable declarations (hoisted) ──────────────────────────────
