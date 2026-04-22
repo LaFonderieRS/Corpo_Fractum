@@ -160,6 +160,18 @@ pub fn analyse(obj: &BinaryObject) -> AnalysisResult<IrModule> {
 
     let mut module = IrModule::default();
     module.functions = functions;
+    
+    // Use enhanced string recovery with DWARF if available
+    let string_table = if let Some(ref dwarf) = obj.dwarf {
+        debug!("Using DWARF-enhanced string recovery");
+        string_recovery::recover_strings_with_dwarf(obj, dwarf)
+            .into_iter()
+            .map(|s| (s.address, s.content))
+            .collect()
+    } else {
+        string_table
+    };
+    
     module.string_table = string_table;
 
     let elapsed = t0.elapsed();

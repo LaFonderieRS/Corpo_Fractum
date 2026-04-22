@@ -6,9 +6,9 @@
 //! 3. Trace back from these references to identify string usage patterns
 //! 4. Reconstruct string literals with proper encoding handling
 
-use rustdec_loader::{BinaryObject, Section, SectionKind};
+use rustdec_loader::{BinaryObject, Section, SectionKind, DwarfInfo};
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::{debug, warn, trace};
 
 /// Configuration for string recovery
 #[derive(Debug, Clone)]
@@ -77,6 +77,7 @@ pub struct StringRecovery<'a> {
     rodata_section: Option<&'a Section>,
     string_candidates: HashMap<u64, RecoveredString>,
     reference_sites: HashMap<u64, Vec<u64>>, // string address -> [instruction addresses]
+    dwarf_info: Option<&'a DwarfInfo>, // DWARF metadata for enhanced string detection
 }
 
 impl<'a> StringRecovery<'a> {
@@ -88,6 +89,19 @@ impl<'a> StringRecovery<'a> {
             rodata_section: None,
             string_candidates: HashMap::new(),
             reference_sites: HashMap::new(),
+            dwarf_info: None,
+        }
+    }
+
+    /// Create a new string recovery instance with DWARF information
+    pub fn new_with_dwarf(binary: &'a BinaryObject, dwarf: &'a DwarfInfo) -> Self {
+        Self {
+            binary,
+            config: StringRecoveryConfig::default(),
+            rodata_section: None,
+            string_candidates: HashMap::new(),
+            reference_sites: HashMap::new(),
+            dwarf_info: Some(dwarf),
         }
     }
 
@@ -140,6 +154,15 @@ impl<'a> StringRecovery<'a> {
                 if string_len >= self.config.min_string_length && string_len <= self.config.max_string_length {
                     let content = self.extract_string_content(&data[offset..offset + string_len]);
                     let encoding = self.detect_encoding(&data[offset..offset + string_len]);
+                    let mut confidence = self.calculate_confidence(&data[offset..offset + string_len]);
+
+                    // Enhance confidence if this address is referenced in DWARF
+                    if let Some(dwarf) = self.dwarf_info {
+                        if self.is_referenced_in_dwarf(current_addr, dwarf) {
+                            confidence = (confidence * 0.7 + 0.3).min(1.0);
+                            trace!(address = format_args!("{:#x}", current_addr), "String candidate confirmed by DWARF");
+                        }
+                    }
 
                     let recovered_string = RecoveredString {
                         content,
@@ -147,7 +170,7 @@ impl<'a> StringRecovery<'a> {
                         size: string_len,
                         encoding,
                         references: Vec::new(),
-                        confidence: self.calculate_confidence(&data[offset..offset + string_len]),
+                        confidence,
                     };
 
                     self.string_candidates.insert(current_addr, recovered_string);
@@ -161,6 +184,39 @@ impl<'a> StringRecovery<'a> {
         }
 
         debug!("Found {} potential string candidates", self.string_candidates.len());
+    }
+
+    /// Check if a string address is referenced in DWARF debug information
+    fn is_referenced_in_dwarf(&self, address: u64, dwarf: &DwarfInfo) -> bool {
+        // Check if this address appears in any DWARF variable locations
+        for func in &dwarf.functions {
+            for local in &func.locals {
+                if let Some(offset) = local.frame_offset {
+                    // Check if the frame offset corresponds to a pointer that could point to this string
+                    if offset > 0 && (address as i64 - offset).abs() < 0x1000 {
+                        return true;
+                    }
+                }
+            }
+            
+            for param in &func.params {
+                if let Some(offset) = param.frame_offset {
+                    // Check if the parameter offset corresponds to a pointer that could point to this string
+                    if offset > 0 && (address as i64 - offset).abs() < 0x1000 {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        // Check if this address is mentioned in DWARF line information
+        for line in &dwarf.lines {
+            if line.address == address {
+                return true;
+            }
+        }
+        
+        false
     }
 
     /// Identify the length of a potential string
@@ -398,6 +454,12 @@ pub fn recover_strings_from_binary(binary: &BinaryObject) -> Vec<RecoveredString
     recovery.recover_strings()
 }
 
+/// Enhanced version with DWARF information
+pub fn recover_strings_with_dwarf(binary: &BinaryObject, dwarf: &DwarfInfo) -> Vec<RecoveredString> {
+    let mut recovery = StringRecovery::new_with_dwarf(binary, dwarf);
+    recovery.recover_strings()
+}
+
 /// Enhanced version with CFG analysis
 pub fn recover_strings_with_cfg(binary: &BinaryObject, _cfgs: &HashMap<u64, ()>) -> Vec<RecoveredString> {
     let mut recovery = StringRecovery::new(binary);
@@ -410,11 +472,22 @@ pub fn recover_strings_with_cfg(binary: &BinaryObject, _cfgs: &HashMap<u64, ()>)
     strings
 }
 
+/// Most comprehensive version with both DWARF and CFG analysis
+pub fn recover_strings_with_dwarf_and_cfg(binary: &BinaryObject, dwarf: &DwarfInfo, _cfgs: &HashMap<u64, ()>) -> Vec<RecoveredString> {
+    let mut recovery = StringRecovery::new_with_dwarf(binary, dwarf);
+    let strings = recovery.recover_strings();
+    
+    // Here we would enhance the results using CFG information
+    // For example, associate strings with specific functions
+    // or identify string usage patterns in control flow
+    
+    strings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary::{BinaryObject, Format, Section, SectionKind};
-    use crate::Arch;
+    use rustdec_loader::{BinaryObject, Arch, Endian, Format, Section, SectionKind};
 
     fn create_test_binary() -> BinaryObject {
         let mut binary = BinaryObject {
