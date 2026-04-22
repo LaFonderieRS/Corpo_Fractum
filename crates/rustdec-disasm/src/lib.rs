@@ -37,17 +37,27 @@ impl Instruction {
     }
 
     pub fn is_terminator(&self) -> bool {
+        // Capstone AT&T adds a size suffix to many mnemonics ("retq", "jmpq").
+        // List both bare and suffixed forms so this works in any syntax mode.
         matches!(self.mnemonic.as_str(),
-            "ret" | "retf" | "retn" | "jmp" | "ljmp" | "hlt" | "ud2" | "int3")
+            "ret"  | "retq"  | "retl"  | "retw"  |
+            "retf" | "retfq" | "retfl" |
+            "retn" |
+            "jmp"  | "jmpq"  | "jmpl"  |
+            "ljmp" | "hlt"   | "ud2"   | "int3")
     }
 
     pub fn is_branch(&self) -> bool {
         let m = self.mnemonic.as_str();
-        m.starts_with('j') && m != "jmp"
+        // All conditional jumps start with 'j'; exclude the unconditional jmp
+        // variants (bare and AT&T-suffixed).
+        m.starts_with('j') && !matches!(m, "jmp" | "jmpq" | "jmpl" | "ljmp")
     }
 
     pub fn is_call(&self) -> bool {
-        matches!(self.mnemonic.as_str(), "call" | "lcall")
+        // Capstone AT&T mode appends a size suffix: "callq" (64-bit), "calll" (32-bit).
+        // Match the Intel form too so this works regardless of syntax mode.
+        self.mnemonic.starts_with("call") || self.mnemonic == "lcall"
     }
 
     /// Extract the direct branch/jump target address from operands.

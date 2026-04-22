@@ -156,11 +156,12 @@ pub fn build_cfg(
 
         // Map the last instruction to an IR Terminator and close the block.
         if insn.is_terminator() {
-            // ret / hlt / ud2 — function exit
-            let is_ret = matches!(insn.mnemonic.as_str(),
-                "ret" | "retf" | "retn" | "hlt" | "ud2" | "int3");
-            // jmp — unconditional transfer
-            let is_jmp = matches!(insn.mnemonic.as_str(), "jmp" | "ljmp");
+            // jmp — unconditional transfer (bare and AT&T-suffixed variants)
+            let is_jmp = matches!(insn.mnemonic.as_str(),
+                "jmp" | "jmpq" | "jmpl" | "ljmp");
+            // Everything else that is_terminator() accepts is a function exit
+            // (ret / retq / hlt / ud2 / int3).
+            let is_ret = !is_jmp;
 
             bb.terminator = if is_ret {
                 trace!(func = %name, at = format_args!("{:#x}", insn.address), "ret");
