@@ -6,6 +6,7 @@
 //! 3. Trace back from these references to identify string usage patterns
 //! 4. Reconstruct string literals with proper encoding handling
 
+use rustdec_ir::{Expr, IrFunction, Stmt, SymbolKind, Value};
 use rustdec_loader::{BinaryObject, Section, SectionKind, DwarfInfo};
 use std::collections::HashMap;
 use tracing::{debug, warn, trace};
@@ -472,6 +473,35 @@ pub fn recover_strings_with_cfg(binary: &BinaryObject, _cfgs: &HashMap<u64, ()>)
     strings
 }
 
+/// Rewrite `Expr::Value(Value::Const { val: addr })` to
+/// `Expr::Symbol { kind: String, name }` for every address in `string_table`.
+///
+/// Must run after address resolution and before codegen.
+/// Returns the number of expressions replaced.
+pub fn apply_rodata_strings(func: &mut IrFunction, string_table: &HashMap<u64, String>) -> usize {
+    let mut count = 0;
+    for block in func.cfg.node_weights_mut() {
+        for stmt in &mut block.stmts {
+            if let Stmt::Assign { rhs, .. } = stmt {
+                let replacement = if let Expr::Value(Value::Const { val, .. }) = &*rhs {
+                    string_table.get(val).map(|text| Expr::Symbol {
+                        addr: *val,
+                        kind: SymbolKind::String,
+                        name: text.clone(),
+                    })
+                } else {
+                    None
+                };
+                if let Some(new_expr) = replacement {
+                    *rhs = new_expr;
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
 /// Most comprehensive version with both DWARF and CFG analysis
 pub fn recover_strings_with_dwarf_and_cfg(binary: &BinaryObject, dwarf: &DwarfInfo, _cfgs: &HashMap<u64, ()>) -> Vec<RecoveredString> {
     let mut recovery = StringRecovery::new_with_dwarf(binary, dwarf);
@@ -574,5 +604,241 @@ mod tests {
 
         let strings = recover_strings_from_binary(&binary);
         assert!(strings.is_empty(), "Should return no strings for empty binary");
+    }
+
+    #[test]
+    fn test_string_with_dwarf_integration() {
+        let binary = create_test_binary();
+        
+        // Create minimal DWARF info for testing
+        let dwarf_info = rustdec_loader::dwarf::DwarfInfo {
+            units: vec![],
+            functions: vec![],
+            lines: vec![],
+            types: vec![],
+        };
+
+        // Test DWARF-enhanced string recovery
+        let strings_with_dwarf = recover_strings_with_dwarf(&binary, &dwarf_info);
+        let strings_without_dwarf = recover_strings_from_binary(&binary);
+        
+        // Should find the same strings (since our test DWARF is minimal)
+        assert_eq!(strings_with_dwarf.len(), strings_without_dwarf.len());
+        
+        // All strings should have reasonable confidence
+        for string in strings_with_dwarf {
+            assert!(string.confidence > 0.5, "String should have reasonable confidence");
+            assert!(!string.content.is_empty(), "String content should not be empty");
+        }
+    }
+
+    #[test]
+    fn test_string_confidence_scores() {
+        let binary = create_test_binary();
+        let strings = recover_strings_from_binary(&binary);
+        
+        // Test that confidence scores are reasonable
+        for string in strings {
+            assert!(string.confidence >= 0.0 && string.confidence <= 1.0, 
+                   "Confidence should be between 0.0 and 1.0");
+            
+            // Longer strings should generally have higher confidence
+            if string.size > 10 {
+                assert!(string.confidence > 0.6, "Longer strings should have higher confidence");
+            }
+        }
+    }
+
+    #[test]
+    fn test_string_references() {
+        let binary = create_test_binary();
+        let strings = recover_strings_from_binary(&binary);
+        
+        // Test that strings have reasonable addresses
+        for string in strings {
+            assert!(string.address > 0, "String should have valid address");
+            assert!(string.size > 0, "String should have positive size");
+            assert!(string.size <= 1024, "String size should be reasonable");
+            
+            // References are simulated in our test, but should be valid addresses
+            for reference in string.references {
+                assert!(reference > 0, "Reference should be valid address");
+            }
+        }
+    }
+
+    #[test]
+    fn test_string_encoding_variations() {
+        // Test with mixed ASCII and potential wide strings
+        let mut binary = BinaryObject {
+            format: Format::Elf,
+            arch: Arch::X86_64,
+            endian: Endian::Little,
+            is_64bit: true,
+            base_address: 0x400000,
+            entry_point: Some(0x401000),
+            sections: Vec::new(),
+            symbols: Vec::new(),
+            dwarf: None,
+        };
+
+        // Add .rodata section with various string types
+        let mut rodata = Vec::new();
+        rodata.extend_from_slice(b"ASCII String\0");
+        rodata.extend_from_slice(&[0u8; 2]); // padding
+        // Add a pattern that might be detected as wide string
+        rodata.extend_from_slice(&[0x54, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00, 0x00, 0x00]);
+        
+        binary.sections.push(Section {
+            name: ".rodata".to_string(),
+            virtual_addr: 0x450000,
+            file_offset: 0,
+            size: rodata.len() as u64,
+            kind: SectionKind::ReadOnlyData,
+            data: rodata,
+        });
+
+        let strings = recover_strings_from_binary(&binary);
+        
+        // Should find at least the ASCII string
+        assert!(!strings.is_empty(), "Should find strings");
+        
+        // Check that we found strings with reasonable properties
+        let mut found_ascii = false;
+        for string in strings {
+            assert!(!string.content.is_empty(), "String content should not be empty");
+            assert!(string.size >= 4, "String should meet minimum length requirement");
+            
+            // Check if we found the ASCII string
+            if string.content == "ASCII String" {
+                found_ascii = true;
+                assert!(matches!(string.encoding, StringEncoding::Utf8), 
+                       "ASCII should be detected as UTF-8");
+            }
+        }
+        
+        assert!(found_ascii, "Should find the ASCII test string");
+    }
+
+    // ── apply_rodata_strings ──────────────────────────────────────────────────
+
+    fn make_func_with_const(addr: u64) -> IrFunction {
+        use rustdec_ir::{BasicBlock, IrType, Terminator};
+        let mut func = IrFunction::new("test_func", 0x401000);
+        let mut bb = BasicBlock::new(0, 0x401000);
+        bb.stmts.push(Stmt::Assign {
+            lhs: 0,
+            ty: IrType::UInt(64),
+            rhs: Expr::Value(Value::Const { val: addr, ty: IrType::UInt(64) }),
+        });
+        bb.terminator = Terminator::Return(None);
+        func.cfg.add_node(bb);
+        func
+    }
+
+    #[test]
+    fn apply_rodata_strings_replaces_matching_const() {
+        let mut func = make_func_with_const(0x402010);
+        let mut table = HashMap::new();
+        table.insert(0x402010u64, "hello world".to_string());
+
+        let count = apply_rodata_strings(&mut func, &table);
+
+        assert_eq!(count, 1);
+        let block = func.cfg.node_weights().next().unwrap();
+        match &block.stmts[0] {
+            Stmt::Assign { rhs: Expr::Symbol { addr, kind, name }, .. } => {
+                assert_eq!(*addr, 0x402010);
+                assert_eq!(*kind, SymbolKind::String);
+                assert_eq!(name, "hello world");
+            }
+            other => panic!("expected Symbol, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn apply_rodata_strings_no_match_leaves_expr_unchanged() {
+        let mut func = make_func_with_const(0xdeadbeef);
+        let count = apply_rodata_strings(&mut func, &HashMap::new());
+        assert_eq!(count, 0);
+        let block = func.cfg.node_weights().next().unwrap();
+        assert!(matches!(
+            &block.stmts[0],
+            Stmt::Assign { rhs: Expr::Value(Value::Const { val: 0xdeadbeef, .. }), .. }
+        ));
+    }
+
+    #[test]
+    fn apply_rodata_strings_skips_var_exprs() {
+        use rustdec_ir::{BasicBlock, IrType, Terminator};
+        let mut func = IrFunction::new("test_func", 0x401000);
+        let mut bb = BasicBlock::new(0, 0x401000);
+        bb.stmts.push(Stmt::Assign {
+            lhs: 1,
+            ty: IrType::UInt(64),
+            rhs: Expr::Value(Value::Var { id: 0, ty: IrType::UInt(64) }),
+        });
+        bb.terminator = Terminator::Return(None);
+        func.cfg.add_node(bb);
+
+        let mut table = HashMap::new();
+        table.insert(0x402010u64, "hello".to_string());
+
+        assert_eq!(apply_rodata_strings(&mut func, &table), 0);
+    }
+
+    #[test]
+    fn apply_rodata_strings_multiple_blocks() {
+        use rustdec_ir::{BasicBlock, IrType, Terminator};
+        let mut func = IrFunction::new("test_func", 0x401000);
+
+        let mut bb0 = BasicBlock::new(0, 0x401000);
+        bb0.stmts.push(Stmt::Assign {
+            lhs: 0,
+            ty: IrType::UInt(64),
+            rhs: Expr::Value(Value::Const { val: 0x402010, ty: IrType::UInt(64) }),
+        });
+        bb0.terminator = Terminator::Jump(1);
+
+        let mut bb1 = BasicBlock::new(1, 0x401010);
+        bb1.stmts.push(Stmt::Assign {
+            lhs: 1,
+            ty: IrType::UInt(64),
+            rhs: Expr::Value(Value::Const { val: 0x402020, ty: IrType::UInt(64) }),
+        });
+        bb1.terminator = Terminator::Return(None);
+
+        func.cfg.add_node(bb0);
+        func.cfg.add_node(bb1);
+
+        let mut table = HashMap::new();
+        table.insert(0x402010u64, "puts arg".to_string());
+        table.insert(0x402020u64, "strcmp arg".to_string());
+
+        assert_eq!(apply_rodata_strings(&mut func, &table), 2);
+    }
+
+    #[test]
+    fn test_string_recovery_config() {
+        let binary = create_test_binary();
+        
+        // Test with custom configuration
+        let config = StringRecoveryConfig {
+            min_string_length: 8, // Only longer strings
+            max_string_length: 50,
+            recover_wide_strings: true,
+            allow_embedded_nulls: false,
+        };
+        
+        let mut recovery = StringRecovery::new(&binary).with_config(config);
+        let strings = recovery.recover_strings();
+        
+        // Should find fewer strings with higher minimum length
+        assert!(strings.len() < 4, "Should find fewer strings with higher min length");
+        
+        // All strings should meet the minimum length requirement
+        for string in strings {
+            assert!(string.size >= 8, "All strings should meet min length requirement");
+        }
     }
 }

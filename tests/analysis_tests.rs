@@ -181,3 +181,119 @@ fn detect_functions_empty_insns_returns_only_entry() {
     // Entry point is still recorded even without instruction data.
     assert!(funcs.contains_key(&0x400000));
 }
+
+// ── DWARF and String Recovery Integration ────────────────────────────────────
+
+#[test]
+fn test_dwarf_string_recovery_integration() {
+    use rustdec_analysis::string_recovery::{recover_strings_from_binary, recover_strings_with_dwarf};
+    use rustdec_loader::dwarf::DwarfInfo;
+    
+    // Create a test binary with .rodata section
+    let mut binary = make_binary(vec![0xC3u8], 0x401000, 0x401000);
+    
+    // Add .rodata section with test strings
+    let mut rodata = Vec::new();
+    rodata.extend_from_slice(b"Test String 1\0");
+    rodata.extend_from_slice(&[0u8; 4]); // padding
+    rodata.extend_from_slice(b"Test String 2\0");
+    
+    binary.sections.push(Section {
+        name: ".rodata".into(),
+        virtual_addr: 0x450000,
+        file_offset: 0,
+        size: rodata.len() as u64,
+        kind: SectionKind::ReadOnlyData,
+        data: rodata,
+    });
+    
+    // Test basic string recovery
+    let basic_strings = recover_strings_from_binary(&binary);
+    assert!(!basic_strings.is_empty(), "Should find strings without DWARF");
+    assert!(basic_strings.len() >= 2, "Should find at least 2 strings");
+    
+    // Test DWARF-enhanced string recovery
+    let dwarf_info = DwarfInfo {
+        units: vec![],
+        functions: vec![],
+        lines: vec![],
+        types: vec![],
+    };
+    
+    let dwarf_strings = recover_strings_with_dwarf(&binary, &dwarf_info);
+    assert!(!dwarf_strings.is_empty(), "Should find strings with DWARF");
+    
+    // Should find the same or more strings with DWARF
+    assert!(dwarf_strings.len() >= basic_strings.len(), 
+           "DWARF-enhanced recovery should find at least as many strings");
+    
+    // Test that found strings have reasonable properties
+    for string in dwarf_strings {
+        assert!(!string.content.is_empty(), "String content should not be empty");
+        assert!(string.address > 0, "String should have valid address");
+        assert!(string.confidence > 0.0, "String should have positive confidence");
+        assert!(string.confidence <= 1.0, "String confidence should not exceed 1.0");
+    }
+}
+
+#[test]
+fn test_string_recovery_with_different_configurations() {
+    use rustdec_analysis::string_recovery::{StringRecovery, StringRecoveryConfig};
+    
+    // Create test binary
+    let mut binary = make_binary(vec![0xC3u8], 0x401000, 0x401000);
+    
+    // Add .rodata with various string lengths
+    let mut rodata = Vec::new();
+    rodata.extend_from_slice(b"short\0");
+    rodata.extend_from_slice(b"medium length string\0");
+    rodata.extend_from_slice(b"very long string that should be found with most configurations\0");
+    
+    binary.sections.push(Section {
+        name: ".rodata".into(),
+        virtual_addr: 0x450000,
+        file_offset: 0,
+        size: rodata.len() as u64,
+        kind: SectionKind::ReadOnlyData,
+        data: rodata,
+    });
+    
+    // Test with default configuration
+    let mut recovery_default = StringRecovery::new(&binary);
+    let default_strings = recovery_default.recover_strings();
+    
+    // Test with strict configuration (longer minimum length)
+    let strict_config = StringRecoveryConfig {
+        min_string_length: 15,
+        max_string_length: 100,
+        recover_wide_strings: true,
+        allow_embedded_nulls: false,
+    };
+    
+    let mut recovery_strict = StringRecovery::new(&binary).with_config(strict_config);
+    let strict_strings = recovery_strict.recover_strings();
+    
+    // Strict config should find fewer strings
+    assert!(strict_strings.len() < default_strings.len(), 
+           "Strict config should find fewer strings");
+    
+    // All strict strings should meet minimum length requirement
+    for string in &strict_strings {
+        assert!(string.size >= 15, "Strict config strings should meet min length");
+    }
+    
+    // Test with permissive configuration
+    let permissive_config = StringRecoveryConfig {
+        min_string_length: 3,
+        max_string_length: 200,
+        recover_wide_strings: true,
+        allow_embedded_nulls: false,
+    };
+    
+    let mut recovery_permissive = StringRecovery::new(&binary).with_config(permissive_config);
+    let permissive_strings = recovery_permissive.recover_strings();
+    
+    // Permissive config should find more strings
+    assert!(permissive_strings.len() >= default_strings.len(), 
+           "Permissive config should find at least as many strings");
+}
