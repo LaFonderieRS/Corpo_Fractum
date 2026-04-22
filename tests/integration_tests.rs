@@ -185,3 +185,67 @@ fn codegen_emits_valid_c_from_trivial_ir() {
     assert!(src.contains("add_numbers"),
         "emitted C source must contain function name; got:\n{src}");
 }
+
+/// Verify that `.rodata` string literals are recovered through both the
+/// `movabsq $addr, %rax` and `leaq disp(%rip), %rax` addressing patterns.
+#[test]
+fn rodata_string_recovery_via_movabs_and_lea() {
+    use rustdec_analysis::build_cfg;
+    use rustdec_lift::lift_function;
+    use rustdec_loader::{Section, SectionKind, BinaryObject, Endian, extract_strings, build_symbol_map};
+    use rustdec_ir::{Expr, SymbolKind};
+    use std::collections::HashMap;
+
+    let rodata = b"hello world\0";
+
+    // movabsq $0x402000, %rax; retq
+    let code_movabs: &[u8] = &[
+        0x48, 0xB8, 0x00, 0x20, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC3,
+    ];
+    // leaq 0xff9(%rip), %rax; retq  — rip at 0x401007, +0xff9 = 0x402000
+    let code_lea: &[u8] = &[
+        0x48, 0x8D, 0x05, 0xF9, 0x0F, 0x00, 0x00,
+        0xC3,
+    ];
+
+    for (label, code) in [("movabsq", code_movabs as &[u8]), ("leaq", code_lea)] {
+        let obj = BinaryObject {
+            format: rustdec_loader::Format::Elf,
+            arch: Arch::X86_64,
+            endian: Endian::Little,
+            is_64bit: true,
+            base_address: 0x400000,
+            entry_point: Some(0x401000),
+            sections: vec![
+                Section { name: ".text".into(), virtual_addr: 0x401000, file_offset: 0,
+                          size: code.len() as u64, kind: SectionKind::Code, data: code.to_vec() },
+                Section { name: ".rodata".into(), virtual_addr: 0x402000, file_offset: 0,
+                          size: rodata.len() as u64, kind: SectionKind::ReadOnlyData, data: rodata.to_vec() },
+            ],
+            symbols: vec![],
+            dwarf: None,
+        };
+
+        let disasm = Disassembler::for_arch(Arch::X86_64).unwrap();
+        let insns  = disasm.disassemble(code, 0x401000).unwrap();
+        let aidx: HashMap<u64, usize> =
+            insns.iter().enumerate().map(|(i, insn)| (insn.address, i)).collect();
+
+        let string_table = extract_strings(&obj);
+        let symbol_map   = build_symbol_map(&obj, &string_table);
+
+        let mut func = build_cfg("test".into(), 0x401000, 0x401000 + code.len() as u64, &insns, &aidx);
+        lift_function(&mut func, &insns, &symbol_map);
+
+        let found = func.blocks_sorted().iter().any(|bb| {
+            bb.stmts.iter().any(|s| matches!(s,
+                rustdec_ir::Stmt::Assign {
+                    rhs: Expr::Symbol { kind: SymbolKind::String, name, .. }, ..
+                } if name == "hello world"
+            ))
+        });
+        assert!(found,
+            "[{label}] expected Expr::Symbol(String, \"hello world\") in lifted IR");
+    }
+}

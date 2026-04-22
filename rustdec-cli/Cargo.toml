@@ -1,13 +1,13 @@
 [package]
-name        = "rustdec-gui"
-description = "GTK4 graphical interface for Corpo Fractum"
+name        = "rustdec-cli"
+description = "CLI interface for Corpo Fractum"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
 rust-version.workspace = true
 
 [[bin]]
-name = "corpo-fractum"
+name = "corpo-fractum-cli"
 path = "src/main.rs"
 
 [features]
@@ -21,7 +21,6 @@ rustdec-ir.workspace       = true
 rustdec-analysis.workspace = true
 rustdec-codegen.workspace  = true
 
-gtk4          = { version = "0.9", features = ["v4_12"] }
 cairo-rs      = "0.20"
 glib          = "0.20"
 async-channel = "2"

@@ -182,25 +182,26 @@ fn lift_insn(
     let mnem = strip_size_suffix(&raw);
     let ops  = insn.operands.trim();
 
-    // Intel syntax: "dst, src".
-    // We also handle AT&T `%`-prefixed operands — normalize_reg strips the `%`.
+    // Capstone emits AT&T syntax: "src, dst" (source first, destination second).
+    // We also handle `%`-prefixed operands — normalize_reg strips the `%`.
     let parts: Vec<&str> = ops.splitn(2, ',').map(str::trim).collect();
-    let dst = parts.first().copied().unwrap_or("");
-    let src = parts.get(1).copied().unwrap_or("");
+    let op0 = parts.first().copied().unwrap_or(""); // AT&T src (single-operand: the operand)
+    let op1 = parts.get(1).copied().unwrap_or("");  // AT&T dst (two-operand instructions)
 
     match mnem {
         // ── Data movement ────────────────────────────────────────────────────
-        "movsx" | "movsxd" => lift_movsx(dst, src, next_id, regs),
-        "mov" | "movabs" | "movzx" | "movz" | "movs" => lift_mov(dst, src, next_id, regs),
+        // Two-operand AT&T: src=op0, dst=op1 — swap relative to Intel convention.
+        "movsx" | "movsxd" => lift_movsx(op1, op0, next_id, regs),
+        "mov" | "movabs" | "movzx" | "movz" | "movs" => lift_mov(op1, op0, next_id, regs),
 
-        "lea"   => lift_lea(dst, src, next_id, regs, insn.address, insn.size),
-        "push"  => lift_push(dst, next_id, regs),
-        "pop"   => lift_pop(dst, next_id, regs),
+        "lea"   => lift_lea(op1, op0, next_id, regs, insn.address, insn.size),
+        "push"  => lift_push(op0, next_id, regs),
+        "pop"   => lift_pop(op0, next_id, regs),
         "leave" => lift_leave(next_id, regs),
 
         "xchg" => {
-            let va = operand_to_val(dst, regs);
-            let vb = operand_to_val(src, regs);
+            let va = operand_to_val(op0, regs);
+            let vb = operand_to_val(op1, regs);
             let ty = value_type(&va);
             let (tmp, tmp_val) = fresh(next_id, ty.clone());
             // tmp = va ; *va_ptr = vb ; *vb_ptr = tmp
@@ -213,33 +214,34 @@ fn lift_insn(
         }
 
         // ── Arithmetic / logic ───────────────────────────────────────────────
+        // Two-operand AT&T: src=op0, dst=op1.
         "add" | "sub" | "and" | "or" | "xor"
         | "cmp" | "test"
         | "adc" | "sbb"
         | "shl" | "shr" | "sar"
-        | "imul" | "mul" => lift_binop(mnem, dst, src, next_id, regs, flags),
+        | "imul" | "mul" => lift_binop(mnem, op1, op0, next_id, regs, flags),
 
-        "div"  => lift_div(dst, next_id, regs, false),
-        "idiv" => lift_div(dst, next_id, regs, true),
+        "div"  => lift_div(op0, next_id, regs, false),
+        "idiv" => lift_div(op0, next_id, regs, true),
 
-        "inc" => lift_incdec(dst, BinOp::Add, next_id, regs),
-        "dec" => lift_incdec(dst, BinOp::Sub, next_id, regs),
+        "inc" => lift_incdec(op0, BinOp::Add, next_id, regs),
+        "dec" => lift_incdec(op0, BinOp::Sub, next_id, regs),
 
         "neg" => {
-            let lhs = operand_to_val(dst, regs);
+            let lhs = operand_to_val(op0, regs);
             let ty  = value_type(&lhs);
             let (id, _) = fresh(next_id, ty.clone());
-            regs.set(dst, id);
+            regs.set(op0, id);
             vec![Stmt::Assign { lhs: id, ty: ty.clone(),
                 rhs: Expr::BinOp { op: BinOp::Sub,
                     lhs: Value::Const { val: 0, ty }, rhs: lhs } }]
         }
 
         "not" => {
-            let lhs = operand_to_val(dst, regs);
+            let lhs = operand_to_val(op0, regs);
             let ty  = value_type(&lhs);
             let (id, _) = fresh(next_id, ty.clone());
-            regs.set(dst, id);
+            regs.set(op0, id);
             vec![Stmt::Assign { lhs: id, ty: ty.clone(),
                 rhs: Expr::BinOp { op: BinOp::Xor, lhs,
                     rhs: Value::Const { val: u64::MAX, ty } } }]
@@ -424,7 +426,39 @@ struct MemExpr<'a> {
 
 impl<'a> MemExpr<'a> {
     fn parse(s: &'a str) -> Self {
+        let s = s.trim().trim_start_matches('*'); // strip AT&T indirect-call marker
         let s = strip_mem_prefix(s);
+
+        // AT&T form: optional_disp(%base, %index, scale) — e.g. "0xff9(%rip)", "-8(%rbp)"
+        if s.contains('(') && !s.contains('[') {
+            let mut expr = MemExpr { scale: 1, ..Default::default() };
+            if let Some(paren) = s.find('(') {
+                let disp_str = s[..paren].trim();
+                if !disp_str.is_empty() {
+                    expr.disp = parse_int_signed(disp_str);
+                }
+                let inner = s[paren + 1..].trim_end_matches(')');
+                let components: Vec<&str> = inner.split(',').map(str::trim).collect();
+                if let Some(base) = components.first() {
+                    let b = base.trim_start_matches('%');
+                    if !b.is_empty() && is_register(b) {
+                        expr.base = Some(b);
+                    }
+                }
+                if let Some(idx) = components.get(1) {
+                    let i = idx.trim_start_matches('%');
+                    if !i.is_empty() && is_register(i) {
+                        expr.index = Some(i);
+                    }
+                }
+                if let Some(sc) = components.get(2) {
+                    expr.scale = parse_int(sc).unwrap_or(1);
+                }
+            }
+            return expr;
+        }
+
+        // Intel form: [base + index*scale + disp]
         let inner = s.trim_start_matches('[').trim_end_matches(']').trim();
         let mut expr = MemExpr { scale: 1, ..Default::default() };
 
@@ -719,6 +753,7 @@ fn lift_call(ops: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt
 /// - Register               → `Var` with the current SSA id from the table
 fn operand_to_val(op: &str, regs: &RegisterTable) -> Value {
     let op = op.trim().trim_start_matches('*'); // strip AT&T indirect marker
+    let op = op.trim_start_matches('$');        // strip AT&T immediate prefix
     let op = op.trim();
 
     if let Some(addr) = parse_hex(op) {

@@ -1,6 +1,6 @@
 [package]
 name        = "rustdec-analysis"
-description = "CFG construction and static analysis for RustDec"
+description = "CFG construction and static analysis for Corpo Fractum"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
