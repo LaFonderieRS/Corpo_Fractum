@@ -8,12 +8,14 @@ pub mod cfg;
 pub mod dominance;
 pub mod functions;
 pub mod structure;
+pub mod string_recovery;
 
 pub use callgraph::{build_call_graph, CallGraph};
 pub use cfg::build_cfg;
 pub use dominance::{DomTree, NaturalLoop, find_natural_loops, find_convergence};
 pub use functions::detect_functions;
 pub use structure::{structure_function, StructuredFunc, SNode, CondExpr};
+pub use string_recovery::{RecoveredString, StringEncoding, recover_strings_from_binary, recover_strings_with_cfg};
 
 use rustdec_ir::IrModule;
 use rustdec_loader::{BinaryObject, build_symbol_map, extract_strings};
