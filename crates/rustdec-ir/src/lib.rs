@@ -126,6 +126,11 @@ pub enum Expr {
     /// - `name`: for `String` — decoded text content;
     ///           for `Function` / `Global` — the symbol identifier.
     Symbol { addr: u64, kind: SymbolKind, name: String },
+    /// Indexed access into a named stack array: `name[index]`.
+    ///
+    /// Produced by the array-recognition pass in `rustdec-lift` when a
+    /// pointer expression decomposes as `array_base + index * stride`.
+    ArrayAccess { name: String, index: Value, elem_ty: IrType },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +152,8 @@ pub enum Stmt {
     Assign { lhs: u32, ty: IrType, rhs: Expr },
     /// `*ptr = val`
     Store { ptr: Value, val: Value },
+    /// `name[index] = val` — array element store (produced by array-recognition pass).
+    ArrayStore { name: String, index: Value, val: Value },
     /// No-op (removed instruction).
     Nop,
 }
@@ -190,6 +197,15 @@ pub enum SlotOrigin {
     Unknown,
 }
 
+/// Metadata attached to the base slot of a recognised stack array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArrayInfo {
+    /// Number of contiguous elements (≥ 2).
+    pub count:  u32,
+    /// Element size in bytes.
+    pub stride: u32,
+}
+
 /// A named, typed slot in the function's stack frame.
 ///
 /// The lifter creates one `StackSlot` for every distinct `[rbp ± offset]`
@@ -205,6 +221,11 @@ pub struct StackSlot {
     pub name:       String,
     /// How we think this slot is used.
     pub origin:     SlotOrigin,
+    /// Set on the *base* slot when this slot is the first element of a
+    /// contiguous stack array.  Non-base element slots are suppressed in
+    /// codegen (the base declaration covers them).
+    #[serde(default)]
+    pub array_info: Option<ArrayInfo>,
 }
 
 // ── Basic Block ───────────────────────────────────────────────────────────────
@@ -299,7 +320,7 @@ impl IrFunction {
     pub fn get_or_insert_slot(&mut self, rbp_offset: i64, ty: IrType) -> &mut StackSlot {
         let slot = self.slot_table.entry(rbp_offset).or_insert_with(|| {
             let (name, origin) = classify_slot(rbp_offset);
-            StackSlot { rbp_offset, ty: IrType::Unknown, name, origin }
+            StackSlot { rbp_offset, ty: IrType::Unknown, name, origin, array_info: None }
         });
         if slot.ty == IrType::Unknown
             || (slot.ty == IrType::UInt(64) && ty != IrType::Unknown)

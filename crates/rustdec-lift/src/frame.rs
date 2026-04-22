@@ -44,7 +44,7 @@
 //! - Type inference is heuristic: slot type defaults to `UInt(64)` unless the
 //!   access size can be read from the `IrType` of the `Load`/`Store`.
 
-use rustdec_ir::{BinOp, CallTarget, Expr, IrFunction, IrType, Stmt, Terminator, Value};
+use rustdec_ir::{ArrayInfo, BinOp, CallTarget, Expr, IrFunction, IrType, SlotOrigin, Stmt, Terminator, Value};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace};
 
@@ -77,6 +77,12 @@ pub fn analyse_frame(func: &mut IrFunction) {
 
     // ── Step 4: discover slots + rewrite expressions ──────────────────────────
     rewrite_frame_accesses(func, &rbp_ids, &rsp_ids, &def_map);
+
+    // ── Step 5: recognise contiguous stack arrays ─────────────────────────────
+    detect_arrays(func);
+
+    // ── Step 6: rewrite indexed array accesses ────────────────────────────────
+    rewrite_array_accesses(func, &rbp_ids, &def_map);
 
     debug!(func  = %func.name,
            slots = func.slot_table.len(),
@@ -728,6 +734,175 @@ pub fn eliminate_canary(func: &mut IrFunction) {
     }
 
     debug!(func = %func.name, "stack canary eliminated");
+}
+
+// ── Array detection and rewriting ────────────────────────────────────────────
+
+/// Identify runs of contiguous same-type `Local` slots and mark the base slot
+/// with `ArrayInfo { count, stride }`.
+///
+/// Slots are sorted by ascending `rbp_offset` (most-negative first = lowest
+/// address = array index 0).  A run of N ≥ 2 consecutive slots at uniform
+/// `stride` (= element byte size) is promoted to an array.
+fn detect_arrays(func: &mut IrFunction) {
+    let mut offsets: Vec<i64> = func.slot_table
+        .iter()
+        .filter(|(_, s)| matches!(s.origin, SlotOrigin::Local) && s.ty != IrType::Unknown)
+        .map(|(off, _)| *off)
+        .collect();
+    offsets.sort();
+
+    let mut i = 0;
+    while i < offsets.len() {
+        let base_off = offsets[i];
+        let base_ty  = func.slot_table[&base_off].ty.clone();
+        let stride = match base_ty.byte_size() {
+            Some(s) if s > 0 => s as i64,
+            _ => { i += 1; continue; }
+        };
+
+        let mut count = 1usize;
+        while i + count < offsets.len() {
+            let expected = base_off + stride * count as i64;
+            let next_off = offsets[i + count];
+            if next_off == expected && func.slot_table[&next_off].ty == base_ty {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+
+        if count >= 2 {
+            let slot = func.slot_table.get_mut(&base_off).unwrap();
+            slot.array_info = Some(ArrayInfo { count: count as u32, stride: stride as u32 });
+            trace!(func   = %func.name,
+                   base   = base_off,
+                   count,
+                   stride,
+                   "stack array detected");
+        }
+
+        i += count;
+    }
+}
+
+/// Rewrite Load/Store statements whose pointer decomposes as
+/// `array_base_rbp_offset + index * stride` into `ArrayAccess` / `ArrayStore`
+/// IR nodes.
+///
+/// This runs after `detect_arrays` so `slot_table` already carries
+/// `ArrayInfo` on eligible base slots.
+fn rewrite_array_accesses(
+    func:    &mut IrFunction,
+    rbp_ids: &[u32],
+    def_map: &HashMap<u32, Expr>,
+) {
+    use petgraph::visit::NodeIndexable;
+    let node_count = func.cfg.node_count();
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        let stmts = std::mem::take(&mut func.cfg[idx].stmts);
+        let new_stmts: Vec<Stmt> = stmts.into_iter().map(|stmt| {
+            match stmt {
+                Stmt::Assign { lhs, ty, rhs: Expr::Load { ptr, ty: load_ty } } => {
+                    if let Some((name, index)) =
+                        try_resolve_array_ptr(&ptr, rbp_ids, def_map, func)
+                    {
+                        Stmt::Assign { lhs, ty, rhs: Expr::ArrayAccess { name, index, elem_ty: load_ty } }
+                    } else {
+                        Stmt::Assign { lhs, ty, rhs: Expr::Load { ptr, ty: load_ty } }
+                    }
+                }
+                Stmt::Store { ptr, val } => {
+                    if let Some((name, index)) =
+                        try_resolve_array_ptr(&ptr, rbp_ids, def_map, func)
+                    {
+                        Stmt::ArrayStore { name, index, val }
+                    } else {
+                        Stmt::Store { ptr, val }
+                    }
+                }
+                other => other,
+            }
+        }).collect();
+        func.cfg[idx].stmts = new_stmts;
+    }
+}
+
+/// Try to decompose `ptr` as `rbp_offset + index * stride`, returning
+/// `(array_name, index_value)` when the offset maps to an array base slot.
+fn try_resolve_array_ptr(
+    ptr:     &Value,
+    rbp_ids: &[u32],
+    def_map: &HashMap<u32, Expr>,
+    func:    &IrFunction,
+) -> Option<(String, Value)> {
+    let ptr_id = match ptr {
+        Value::Var { id, .. } => *id,
+        _ => return None,
+    };
+
+    let (rbp_off, index, stride) = decompose_indexed_ptr(ptr_id, rbp_ids, def_map)?;
+
+    let slot = func.slot_table.get(&rbp_off)?;
+    let info = slot.array_info.as_ref()?;
+    if info.stride as u64 != stride { return None; }
+
+    Some((slot.name.clone(), index))
+}
+
+/// Walk the def_map chain for `ptr_id` trying to decompose the expression as
+/// `const_rbp_offset + index * stride`.
+///
+/// Handles two patterns:
+/// - `Add(rbp_base, Mul(index, stride))` — base first, scaled index second
+/// - `Sub(Add(rbp_var, Mul(index, stride)), K)` — LEA-style with final subtraction
+fn decompose_indexed_ptr(
+    ptr_id:  u32,
+    rbp_ids: &[u32],
+    def_map: &HashMap<u32, Expr>,
+) -> Option<(i64, Value, u64)> {
+    match def_map.get(&ptr_id)? {
+        Expr::BinOp { op: BinOp::Add, lhs, rhs } => {
+            // Try lhs = rbp-relative base, rhs = scaled index.
+            if let Some(off) = resolve_offset(lhs, rbp_ids, def_map) {
+                if let Some((idx, s)) = try_extract_scaled(rhs, def_map) {
+                    return Some((off, idx, s));
+                }
+            }
+            // Try rhs = rbp-relative base, lhs = scaled index.
+            if let Some(off) = resolve_offset(rhs, rbp_ids, def_map) {
+                if let Some((idx, s)) = try_extract_scaled(lhs, def_map) {
+                    return Some((off, idx, s));
+                }
+            }
+            None
+        }
+        // LEA [rbp + idx*scale - K]: inner is Add, outer subtracts a constant.
+        Expr::BinOp { op: BinOp::Sub, lhs: Value::Var { id: inner_id, .. }, rhs: Value::Const { val: k, .. } } => {
+            let (off, idx, s) = decompose_indexed_ptr(*inner_id, rbp_ids, def_map)?;
+            Some((off - *k as i64, idx, s))
+        }
+        _ => None,
+    }
+}
+
+/// If `val` is a Var defined as `Mul(index, stride_const)` (or the
+/// commuted form), return `(index, stride_const)`.
+fn try_extract_scaled(val: &Value, def_map: &HashMap<u32, Expr>) -> Option<(Value, u64)> {
+    let id = match val {
+        Value::Var { id, .. } => *id,
+        _ => return None,
+    };
+    match def_map.get(&id)? {
+        Expr::BinOp { op: BinOp::Mul, lhs, rhs: Value::Const { val: s, .. } } if *s > 0 => {
+            Some((lhs.clone(), *s))
+        }
+        Expr::BinOp { op: BinOp::Mul, lhs: Value::Const { val: s, .. }, rhs } if *s > 0 => {
+            Some((rhs.clone(), *s))
+        }
+        _ => None,
+    }
 }
 
 // ── Legacy public helpers (kept for codegen compatibility) ────────────────────

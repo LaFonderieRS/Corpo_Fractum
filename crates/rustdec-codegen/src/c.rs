@@ -111,11 +111,49 @@ impl CodegenBackend for CBackend {
         }
 
         // ── Emit slot declarations (local variables, hoisted) ─────────────────
+        // Collect base offsets of recognised arrays to suppress their element slots.
+        let array_bases: std::collections::HashSet<i64> = func.slot_table
+            .iter()
+            .filter(|(_, s)| s.array_info.is_some())
+            .map(|(off, _)| *off)
+            .collect();
+        let array_member_offsets: std::collections::HashSet<i64> = func.slot_table
+            .iter()
+            .filter(|(off, s)| {
+                matches!(s.origin, SlotOrigin::Local)
+                    && s.array_info.is_none()
+                    && !array_bases.contains(off)
+            })
+            .filter_map(|(off, s)| {
+                // Suppress this slot if a base array covers it.
+                let ty_size = s.ty.byte_size().unwrap_or(0) as i64;
+                if ty_size == 0 { return None; }
+                for &base_off in &array_bases {
+                    let base_slot = func.slot_table.get(&base_off)?;
+                    let info = base_slot.array_info.as_ref()?;
+                    let stride = info.stride as i64;
+                    let count  = info.count as i64;
+                    // Element offsets: base_off, base_off+stride, ..., base_off+(count-1)*stride
+                    for k in 1..count {
+                        if *off == base_off + stride * k { return Some(*off); }
+                    }
+                }
+                None
+            })
+            .collect();
+
         let mut slot_decls: Vec<String> = func.slot_table
             .values()
             .filter(|s| matches!(s.origin, SlotOrigin::Local))
             .filter(|s| !matches!(s.ty, IrType::Unknown))
-            .map(|s| format!("  {} {};", self.emit_type(&s.ty), s.name))
+            .filter(|s| !array_member_offsets.contains(&s.rbp_offset))
+            .map(|s| {
+                if let Some(info) = &s.array_info {
+                    format!("  {} {}[{}];", self.emit_type(&s.ty), s.name, info.count)
+                } else {
+                    format!("  {} {};", self.emit_type(&s.ty), s.name)
+                }
+            })
             .collect();
         slot_decls.sort();
         if !slot_decls.is_empty() {
@@ -372,6 +410,14 @@ impl CBackend {
                 let val_s = display_value(val_r, copies, slots, reg_names);
                 Some(format!("*({ptr_s}) = {val_s}"))
             }
+
+            Stmt::ArrayStore { name, index, val } => {
+                let idx_r = resolve(index, copies);
+                let val_r = resolve(val, copies);
+                let idx_s = display_value(idx_r, copies, slots, reg_names);
+                let val_s = display_value(val_r, copies, slots, reg_names);
+                Some(format!("{name}[{idx_s}] = {val_s}"))
+            }
         }
     }
 
@@ -594,6 +640,12 @@ impl CBackend {
                 SymbolKind::Function => name.clone(),
                 SymbolKind::Global   => name.clone(),
             },
+
+            Expr::ArrayAccess { name, index, .. } => {
+                let idx_r = resolve(index, copies);
+                let idx_s = display_value(idx_r, copies, slots, reg_names);
+                format!("{name}[{idx_s}]")
+            }
         }
     }
 }

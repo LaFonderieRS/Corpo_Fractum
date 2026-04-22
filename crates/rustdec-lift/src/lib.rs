@@ -394,6 +394,10 @@ fn collect_reads_stmt(stmt: &Stmt, live: &mut HashSet<u32>) {
             collect_reads_value(ptr, live);
             collect_reads_value(val, live);
         }
+        Stmt::ArrayStore { index, val, .. } => {
+            collect_reads_value(index, live);
+            collect_reads_value(val, live);
+        }
         Stmt::Nop => {}
     }
 }
@@ -410,6 +414,7 @@ fn collect_reads_expr(expr: &Expr, live: &mut HashSet<u32>) {
         Expr::Call { args, .. }            => {
             for a in args { collect_reads_value(a, live); }
         }
+        Expr::ArrayAccess { index, .. }    => collect_reads_value(index, live),
         Expr::Symbol { .. }                => {}
         Expr::Opaque(_)                    => {}
     }
@@ -658,6 +663,10 @@ fn copy_propagate_slots(func: &mut IrFunction) {
                     subst_value(ptr, &sub_map);
                     subst_value(val, &sub_map);
                 }
+                Stmt::ArrayStore { index, val, .. } => {
+                    subst_value(index, &sub_map);
+                    subst_value(val, &sub_map);
+                }
                 Stmt::Nop => {}
             }
         }
@@ -688,6 +697,7 @@ fn subst_expr(expr: &mut Expr, map: &HashMap<u32, Value>) {
         Expr::Load  { ptr, .. }      => subst_value(ptr, map),
         Expr::Cast  { val, .. }      => subst_value(val, map),
         Expr::Call  { args, .. }     => args.iter_mut().for_each(|a| subst_value(a, map)),
+        Expr::ArrayAccess { index, .. } => subst_value(index, map),
         Expr::Symbol { .. } | Expr::Opaque(_) => {}
     }
 }
