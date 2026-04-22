@@ -7,6 +7,7 @@ members = [
     "crates/rustdec-analysis",
     "crates/rustdec-codegen",
     "crates/rustdec-tests",
+    "crates/rustdec-bench",
     "rustdec-gui",
 ]
 resolver = "2"

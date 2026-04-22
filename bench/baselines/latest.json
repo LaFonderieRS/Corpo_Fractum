@@ -1,0 +1,66 @@
+{
+  "timestamp": "2026-04-22T13:31:23Z",
+  "git_hash": "a854f22",
+  "cases": [
+    {
+      "case": "hello_world",
+      "success": true,
+      "elapsed_ms": 2,
+      "metrics": {
+        "functions": 2,
+        "stack_slots": 0,
+        "if_count": 0,
+        "loop_count": 0,
+        "temp_vars": 8,
+        "goto_count": 0
+      }
+    },
+    {
+      "case": "retrieve_argc",
+      "success": true,
+      "elapsed_ms": 0,
+      "metrics": {
+        "functions": 2,
+        "stack_slots": 0,
+        "if_count": 0,
+        "loop_count": 0,
+        "temp_vars": 27,
+        "goto_count": 0
+      }
+    },
+    {
+      "case": "simple_if",
+      "success": true,
+      "elapsed_ms": 0,
+      "metrics": {
+        "functions": 2,
+        "stack_slots": 0,
+        "if_count": 0,
+        "loop_count": 0,
+        "temp_vars": 8,
+        "goto_count": 0
+      }
+    },
+    {
+      "case": "simple_if_argv",
+      "success": true,
+      "elapsed_ms": 0,
+      "metrics": {
+        "functions": 3,
+        "stack_slots": 0,
+        "if_count": 1,
+        "loop_count": 0,
+        "temp_vars": 25,
+        "goto_count": 0
+      }
+    }
+  ],
+  "totals": {
+    "functions": 9,
+    "stack_slots": 0,
+    "if_count": 1,
+    "loop_count": 0,
+    "temp_vars": 68,
+    "goto_count": 0
+  }
+}
