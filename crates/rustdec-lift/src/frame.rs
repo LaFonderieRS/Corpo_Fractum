@@ -46,6 +46,7 @@
 
 use rustdec_ir::{ArrayInfo, BinOp, CallTarget, Expr, IrFunction, IrType, SlotOrigin, Stmt, Terminator, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, trace};
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -637,7 +638,7 @@ fn resolve_frame_ptr(
 /// Encoding: id = 10_000 + (offset + 4096) keeps the range positive.
 pub fn slot_ptr_val(rbp_offset: i64) -> Value {
     let id = (10_000i64 + rbp_offset + 4096) as u32;
-    Value::Var { id, ty: IrType::ptr(IrType::UInt(64)) }
+    Value::Var { id, ty: Arc::new(IrType::ptr(IrType::UInt(64))) }
 }
 
 /// Inverse: given a slot var id, recover the rbp_offset.

@@ -518,6 +518,7 @@ pub fn recover_strings_with_dwarf_and_cfg(binary: &BinaryObject, dwarf: &DwarfIn
 mod tests {
     use super::*;
     use rustdec_loader::{BinaryObject, Arch, Endian, Format, Section, SectionKind};
+    use std::sync::Arc;
 
     fn create_test_binary() -> BinaryObject {
         let mut binary = BinaryObject {
@@ -729,7 +730,7 @@ mod tests {
         bb.stmts.push(Stmt::Assign {
             lhs: 0,
             ty: IrType::UInt(64),
-            rhs: Expr::Value(Value::Const { val: addr, ty: IrType::UInt(64) }),
+            rhs: Expr::Value(Value::Const { val: addr, ty: Arc::new(IrType::UInt(64)) }),
         });
         bb.terminator = Terminator::Return(None);
         func.cfg.add_node(bb);
@@ -776,7 +777,7 @@ mod tests {
         bb.stmts.push(Stmt::Assign {
             lhs: 1,
             ty: IrType::UInt(64),
-            rhs: Expr::Value(Value::Var { id: 0, ty: IrType::UInt(64) }),
+            rhs: Expr::Value(Value::Var { id: 0, ty: Arc::new(IrType::UInt(64)) }),
         });
         bb.terminator = Terminator::Return(None);
         func.cfg.add_node(bb);
@@ -796,7 +797,7 @@ mod tests {
         bb0.stmts.push(Stmt::Assign {
             lhs: 0,
             ty: IrType::UInt(64),
-            rhs: Expr::Value(Value::Const { val: 0x402010, ty: IrType::UInt(64) }),
+            rhs: Expr::Value(Value::Const { val: 0x402010, ty: Arc::new(IrType::UInt(64)) }),
         });
         bb0.terminator = Terminator::Jump(1);
 
@@ -804,7 +805,7 @@ mod tests {
         bb1.stmts.push(Stmt::Assign {
             lhs: 1,
             ty: IrType::UInt(64),
-            rhs: Expr::Value(Value::Const { val: 0x402020, ty: IrType::UInt(64) }),
+            rhs: Expr::Value(Value::Const { val: 0x402020, ty: Arc::new(IrType::UInt(64)) }),
         });
         bb1.terminator = Terminator::Return(None);
 

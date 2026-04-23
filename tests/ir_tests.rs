@@ -76,23 +76,23 @@ fn irtype_constructors_match_enum_variants() {
 
 #[test]
 fn value_display_var() {
-    assert_eq!(Value::Var { id: 0,  ty: IrType::UInt(64) }.display(), "v0");
-    assert_eq!(Value::Var { id: 42, ty: IrType::UInt(32) }.display(), "v42");
-    assert_eq!(Value::Var { id: 999, ty: IrType::Unknown }.display(), "v999");
+    assert_eq!(Value::Var { id: 0,  ty: IrType::UInt(64).into() }.display(), "v0");
+    assert_eq!(Value::Var { id: 42, ty: IrType::UInt(32).into() }.display(), "v42");
+    assert_eq!(Value::Var { id: 999, ty: IrType::Unknown.into() }.display(), "v999");
 }
 
 #[test]
 fn value_display_const_hex() {
-    assert_eq!(Value::Const { val: 0,      ty: IrType::UInt(64) }.display(), "0x0");
-    assert_eq!(Value::Const { val: 0x1234, ty: IrType::UInt(64) }.display(), "0x1234");
-    assert_eq!(Value::Const { val: u64::MAX, ty: IrType::UInt(64) }.display(),
+    assert_eq!(Value::Const { val: 0,      ty: IrType::UInt(64).into() }.display(), "0x0");
+    assert_eq!(Value::Const { val: 0x1234, ty: IrType::UInt(64).into() }.display(), "0x1234");
+    assert_eq!(Value::Const { val: u64::MAX, ty: IrType::UInt(64).into() }.display(),
                format!("{:#x}", u64::MAX));
 }
 
 #[test]
 fn value_ty_returns_inner_type() {
-    let v = Value::Var   { id: 1, ty: IrType::SInt(32) };
-    let c = Value::Const { val: 7, ty: IrType::UInt(8) };
+    let v = Value::Var   { id: 1, ty: IrType::SInt(32).into() };
+    let c = Value::Const { val: 7, ty: IrType::UInt(8).into() };
     assert_eq!(v.ty(), &IrType::SInt(32));
     assert_eq!(c.ty(), &IrType::UInt(8));
 }

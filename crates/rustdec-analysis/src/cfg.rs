@@ -21,6 +21,7 @@ use petgraph::graph::NodeIndex;
 use rustdec_disasm::Instruction;
 use rustdec_ir::{BasicBlock, BlockId, CfgEdge, IrFunction, Terminator, Value, IrType};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
 /// Build an [`IrFunction`] CFG.
@@ -200,7 +201,7 @@ pub fn build_cfg(
                    "conditional branch");
             let from = bb.start_addr;
             bb.terminator = Terminator::Branch {
-                cond:     Value::Const { val: 0, ty: IrType::UInt(8) }, // placeholder
+                cond:     Value::Const { val: 0, ty: Arc::new(IrType::UInt(8)) }, // placeholder
                 _true_bb:  0,
                 _false_bb: 0,
                 // Preserve the exact branch mnemonic so codegen can emit the

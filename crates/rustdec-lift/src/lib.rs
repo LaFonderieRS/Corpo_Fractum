@@ -11,6 +11,7 @@ use rustdec_disasm::Instruction;
 use rustdec_ir::{BinOp, Expr, IrFunction, IrType, SymbolKind, Stmt, Terminator, Value};
 use rustdec_loader::{SymbolMap, SymbolMapKind};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, instrument, trace};
 
 /// Lift all basic blocks of `func` in-place, then analyse the stack frame.
@@ -62,7 +63,7 @@ pub fn lift_function(
                        block   = format_args!("{:#x}", start_addr),
                        rax_id  = id,
                        "patching Return with rax value");
-                Terminator::Return(Some(Value::Var { id, ty: IrType::UInt(64) }))
+                Terminator::Return(Some(Value::Var { id, ty: Arc::new(IrType::UInt(64)) }))
             } else {
                 Terminator::Return(None)
             };
@@ -232,7 +233,7 @@ fn resolve_constants(func: &mut IrFunction, symbols: &SymbolMap) {
                                                "resolve_constants: call arg → Const(addr)");
                                         *arg = Value::Const {
                                             val: addr,
-                                            ty:  IrType::Ptr(Box::new(IrType::UInt(8))),
+                                            ty:  Arc::new(IrType::Ptr(Box::new(IrType::UInt(8)))),
                                         };
                                     }
                                 }

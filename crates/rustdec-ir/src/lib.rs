@@ -14,6 +14,7 @@
 
 use petgraph::graph::DiGraph;
 use std::collections::HashMap;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 // ── Provenance ────────────────────────────────────────────────────────────────
@@ -81,18 +82,25 @@ impl IrType {
 
 // ── Values ────────────────────────────────────────────────────────────────────
 
+/// Reference-counted handle to an [`IrType`].
+///
+/// Cloning an `IrTypeRef` is a single atomic reference-count increment rather
+/// than a deep copy of the type graph.  This matters in the x86 lifter, where
+/// each instruction can emit 5–30 `Value` copies that all carry the same type.
+pub type IrTypeRef = Arc<IrType>;
+
 /// A value: either a variable reference or an immediate constant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
     /// SSA variable, uniquely identified by (function-scoped) index.
-    Var { id: u32, ty: IrType },
+    Var { id: u32, ty: IrTypeRef },
     /// Integer constant.
-    Const { val: u64, ty: IrType },
+    Const { val: u64, ty: IrTypeRef },
 }
 
 impl Value {
     pub fn ty(&self) -> &IrType {
-        match self { Self::Var { ty, .. } | Self::Const { ty, .. } => ty }
+        match self { Self::Var { ty, .. } | Self::Const { ty, .. } => &**ty }
     }
 
     pub fn display(&self) -> String {
