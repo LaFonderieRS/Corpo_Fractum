@@ -536,12 +536,12 @@ fn infer_seed_type(func: &IrFunction, seed: u32) -> IrType {
                 // movzx-style cast: seed is being narrowed → use the target type.
                 Stmt::Assign {
                     rhs: Expr::Cast { val: Value::Var { id, .. }, to }, ..
-                } if *id == seed => return to.clone(),
+                } if *id == seed => return (**to).clone(),
 
                 // Load through seed: seed is a pointer → Ptr(pointee_ty).
                 Stmt::Assign {
                     rhs: Expr::Load { ptr: Value::Var { id, .. }, ty }, ..
-                } if *id == seed => return IrType::Ptr(Box::new(ty.clone())),
+                } if *id == seed => return IrType::Ptr(Box::new((**ty).clone())),
 
                 _ => {}
             }

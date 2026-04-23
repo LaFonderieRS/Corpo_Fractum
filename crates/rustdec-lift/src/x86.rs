@@ -203,12 +203,12 @@ fn lift_insn(
         "xchg" => {
             let va = operand_to_val(op0, regs);
             let vb = operand_to_val(op1, regs);
-            let ty = value_type(&va);
-            let (tmp, tmp_val) = fresh(next_id, ty.clone());
+            let ty = value_type(&va); // IrTypeRef
+            let (tmp, tmp_val) = fresh(next_id, Arc::clone(&ty));
             // tmp = va ; *va_ptr = vb ; *vb_ptr = tmp
             // (simplified — we don't emit true pointer semantics for xchg)
             vec![
-                Stmt::Assign { lhs: tmp, ty: (*ty).clone(), rhs: Expr::Value(va.clone()) },
+                Stmt::Assign { lhs: tmp, ty, rhs: Expr::Value(va.clone()) },
                 Stmt::Store  { ptr: va, val: vb.clone() },
                 Stmt::Store  { ptr: vb, val: tmp_val },
             ]
@@ -230,20 +230,20 @@ fn lift_insn(
 
         "neg" => {
             let lhs = operand_to_val(op0, regs);
-            let ty  = value_type(&lhs);
-            let (id, _) = fresh(next_id, ty.clone());
+            let ty  = value_type(&lhs); // IrTypeRef
+            let (id, _) = fresh(next_id, Arc::clone(&ty));
             regs.set(op0, id);
-            vec![Stmt::Assign { lhs: id, ty: (*ty).clone(),
+            vec![Stmt::Assign { lhs: id, ty: Arc::clone(&ty),
                 rhs: Expr::BinOp { op: BinOp::Sub,
                     lhs: Value::Const { val: 0, ty }, rhs: lhs } }]
         }
 
         "not" => {
             let lhs = operand_to_val(op0, regs);
-            let ty  = value_type(&lhs);
-            let (id, _) = fresh(next_id, ty.clone());
+            let ty  = value_type(&lhs); // IrTypeRef
+            let (id, _) = fresh(next_id, Arc::clone(&ty));
             regs.set(op0, id);
-            vec![Stmt::Assign { lhs: id, ty: (*ty).clone(),
+            vec![Stmt::Assign { lhs: id, ty: Arc::clone(&ty),
                 rhs: Expr::BinOp { op: BinOp::Xor, lhs,
                     rhs: Value::Const { val: u64::MAX, ty } } }]
         }
@@ -258,7 +258,7 @@ fn lift_insn(
         | "movsb" | "movsd" | "movsq"
         | "scasb" | "scasq" | "lodsb" | "lodsq" => {
             let (id, _) = fresh(next_id, IrType::Void);
-            vec![Stmt::Assign { lhs: id, ty: IrType::Void,
+            vec![Stmt::Assign { lhs: id, ty: Arc::new(IrType::Void),
                 rhs: Expr::Opaque(format!("{} {}", insn.mnemonic, ops)) }]
         }
 
@@ -286,7 +286,7 @@ fn lift_insn(
         other => {
             warn!(mnem = %other, ops = %ops, "unhandled instruction — emitting Opaque");
             let (id, _) = fresh(next_id, IrType::Unknown);
-            vec![Stmt::Assign { lhs: id, ty: IrType::Unknown,
+            vec![Stmt::Assign { lhs: id, ty: Arc::new(IrType::Unknown),
                 rhs: Expr::Opaque(format!("{} {}", insn.mnemonic, ops)) }]
         }
     }
@@ -295,7 +295,7 @@ fn lift_insn(
 // ── Sub-lifters ───────────────────────────────────────────────────────────────
 
 fn lift_mov(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
-    let dst_ty = reg_type(dst);
+    let dst_ty = reg_type(dst); // IrTypeRef
 
     if is_mem(dst) {
         let src_val = operand_to_val(src, regs);
@@ -309,31 +309,32 @@ fn lift_mov(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable) -
     let (rhs_expr, extra_stmts) = if is_mem(src) {
         // Load from memory — emit full address computation.
         let (ptr_stmts, ptr_val) = operand_ptr_full(src, next_id, regs);
-        let expr = Expr::Load { ptr: ptr_val, ty: dst_ty.clone() };
+        let expr = Expr::Load { ptr: ptr_val, ty: Arc::clone(&dst_ty) };
         (expr, ptr_stmts)
     } else {
         let src_val = operand_to_val(src, regs);
-        let expr = if *value_type(&src_val) != dst_ty {
-            Expr::Cast { val: src_val, to: dst_ty.clone() }
+        let expr = if *value_type(&src_val) != *dst_ty {
+            Expr::Cast { val: src_val, to: Arc::clone(&dst_ty) }
         } else {
             Expr::Value(src_val)
         };
         (expr, vec![])
     };
 
-    let (new_id, _) = fresh(next_id, dst_ty.clone());
+    let (new_id, _) = fresh(next_id, Arc::clone(&dst_ty));
     regs.set(dst, new_id);
 
     let mut stmts = extra_stmts;
-    stmts.push(Stmt::Assign { lhs: new_id, ty: dst_ty.clone(), rhs: rhs_expr });
+    stmts.push(Stmt::Assign { lhs: new_id, ty: Arc::clone(&dst_ty), rhs: rhs_expr });
 
     // x86-64: writing eXX zero-extends into rXX.
-    if dst_ty == IrType::UInt(32) && is_gp_reg(dst) {
-        let ext_id = alloc(next_id, IrType::UInt(64));
+    if *dst_ty == IrType::UInt(32) && is_gp_reg(dst) {
+        let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
+        let ext_id = alloc(next_id, Arc::clone(&u64_ty));
         regs.set(&to_64bit_name(dst), ext_id);
         stmts.push(Stmt::Assign {
-            lhs: ext_id, ty: IrType::UInt(64),
-            rhs: Expr::Cast { val: Value::Var { id: new_id, ty: Arc::new(dst_ty) }, to: IrType::UInt(64) },
+            lhs: ext_id, ty: Arc::clone(&u64_ty),
+            rhs: Expr::Cast { val: Value::Var { id: new_id, ty: dst_ty }, to: u64_ty },
         });
     }
     stmts
@@ -341,31 +342,33 @@ fn lift_mov(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable) -
 
 fn lift_push(src: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
     // push src  ≡  rsp -= 8 ; *rsp = src
+    let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
     let val = operand_to_val(src, regs);
     let rsp_old = reg_val("rsp", regs);
-    let (rsp_new, rsp_new_val) = fresh(next_id, IrType::UInt(64));
+    let (rsp_new, rsp_new_val) = fresh(next_id, Arc::clone(&u64_ty));
     regs.set("rsp", rsp_new);
     vec![
-        Stmt::Assign { lhs: rsp_new, ty: IrType::UInt(64),
+        Stmt::Assign { lhs: rsp_new, ty: Arc::clone(&u64_ty),
             rhs: Expr::BinOp { op: BinOp::Sub, lhs: rsp_old,
-                rhs: Value::Const { val: 8, ty: Arc::new(IrType::UInt(64)) } } },
+                rhs: Value::Const { val: 8, ty: Arc::clone(&u64_ty) } } },
         Stmt::Store { ptr: rsp_new_val, val },
     ]
 }
 
 fn lift_pop(dst: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
     // pop dst  ≡  dst = *rsp ; rsp += 8
-    let ty      = reg_type(dst);
+    let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
+    let ty      = reg_type(dst); // IrTypeRef
     let rsp_ptr = reg_val("rsp", regs);
-    let (dst_id, _) = fresh(next_id, ty.clone());
+    let (dst_id, _) = fresh(next_id, Arc::clone(&ty));
     regs.set(dst, dst_id);
     let rsp_old = reg_val("rsp", regs);
-    let (rsp_new, _) = fresh(next_id, IrType::UInt(64));
+    let (rsp_new, _) = fresh(next_id, Arc::clone(&u64_ty));
     regs.set("rsp", rsp_new);
     vec![
         Stmt::Assign { lhs: dst_id, ty,
-            rhs: Expr::Load { ptr: rsp_ptr, ty: IrType::UInt(64) } },
-        Stmt::Assign { lhs: rsp_new, ty: IrType::UInt(64),
+            rhs: Expr::Load { ptr: rsp_ptr, ty: Arc::clone(&u64_ty) } },
+        Stmt::Assign { lhs: rsp_new, ty: u64_ty,
             rhs: Expr::BinOp { op: BinOp::Add, lhs: rsp_old,
                 rhs: Value::Const { val: 8, ty: Arc::new(IrType::UInt(64)) } } },
     ]
@@ -382,23 +385,25 @@ fn lift_syscall(next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
     let a5  = reg_val("r9",  regs);
     let (ret_id, _) = fresh(next_id, IrType::SInt(64));
     regs.set("rax", ret_id);
+    let s64_ty: IrTypeRef = Arc::new(IrType::SInt(64));
     vec![Stmt::Assign {
         lhs: ret_id,
-        ty:  IrType::SInt(64),
+        ty:  Arc::clone(&s64_ty),
         rhs: Expr::Call {
             target: CallTarget::Named(Arc::from("__syscall")),
             args:   vec![nr, a0, a1, a2, a3, a4, a5],
-            ret_ty: IrType::SInt(64),
+            ret_ty: s64_ty,
         },
     }]
 }
 
 fn lift_leave(next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
     // leave ≡ mov rsp, rbp ; pop rbp
+    let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
     let rbp_val = reg_val("rbp", regs);
-    let (rsp_id, _) = fresh(next_id, IrType::UInt(64));
+    let (rsp_id, _) = fresh(next_id, Arc::clone(&u64_ty));
     regs.set("rsp", rsp_id);
-    let mut stmts = vec![Stmt::Assign { lhs: rsp_id, ty: IrType::UInt(64),
+    let mut stmts = vec![Stmt::Assign { lhs: rsp_id, ty: u64_ty,
         rhs: Expr::Value(rbp_val) }];
     stmts.extend(lift_pop("rbp", next_id, regs));
     stmts
@@ -407,10 +412,10 @@ fn lift_leave(next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
 /// Shared implementation for `inc` and `dec`.
 fn lift_incdec(dst: &str, op: BinOp, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
     let lhs = operand_to_val(dst, regs);
-    let ty  = value_type(&lhs);
-    let (id, _) = fresh(next_id, ty.clone());
+    let ty  = value_type(&lhs); // IrTypeRef
+    let (id, _) = fresh(next_id, Arc::clone(&ty));
     regs.set(dst, id);
-    vec![Stmt::Assign { lhs: id, ty: (*ty).clone(),
+    vec![Stmt::Assign { lhs: id, ty: Arc::clone(&ty),
         rhs: Expr::BinOp { op, lhs,
             rhs: Value::Const { val: 1, ty: Arc::new(IrType::UInt(64)) } } }]
 }
@@ -530,14 +535,16 @@ impl<'a> MemExpr<'a> {
             let scaled = if self.scale == 1 {
                 idx_val
             } else {
-                let (s_id, s_val) = fresh(next_id, IrType::UInt(64));
-                stmts.push(Stmt::Assign { lhs: s_id, ty: IrType::UInt(64),
+                let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
+                let (s_id, s_val) = fresh(next_id, Arc::clone(&u64_ty));
+                stmts.push(Stmt::Assign { lhs: s_id, ty: u64_ty,
                     rhs: Expr::BinOp { op: BinOp::Mul, lhs: idx_val,
                         rhs: Value::Const { val: self.scale, ty: Arc::new(IrType::UInt(64)) } } });
                 s_val
             };
-            let (a_id, a_val) = fresh(next_id, IrType::UInt(64));
-            stmts.push(Stmt::Assign { lhs: a_id, ty: IrType::UInt(64),
+            let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
+            let (a_id, a_val) = fresh(next_id, Arc::clone(&u64_ty));
+            stmts.push(Stmt::Assign { lhs: a_id, ty: u64_ty,
                 rhs: Expr::BinOp { op: BinOp::Add, lhs: acc, rhs: scaled } });
             acc = a_val;
         }
@@ -550,8 +557,9 @@ impl<'a> MemExpr<'a> {
                 } else {
                     (BinOp::Add, d as u64)
                 };
-                let (a_id, a_val) = fresh(next_id, IrType::UInt(64));
-                stmts.push(Stmt::Assign { lhs: a_id, ty: IrType::UInt(64),
+                let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
+                let (a_id, a_val) = fresh(next_id, Arc::clone(&u64_ty));
+                stmts.push(Stmt::Assign { lhs: a_id, ty: u64_ty,
                     rhs: Expr::BinOp { op, lhs: acc,
                         rhs: Value::Const { val: abs, ty: Arc::new(IrType::UInt(64)) } } });
                 acc = a_val;
@@ -559,9 +567,10 @@ impl<'a> MemExpr<'a> {
         }
 
         // Cast to pointer.
-        let (ptr_id, ptr_val) = fresh(next_id, IrType::ptr(IrType::UInt(64)));
-        stmts.push(Stmt::Assign { lhs: ptr_id, ty: IrType::ptr(IrType::UInt(64)),
-            rhs: Expr::Cast { val: acc, to: IrType::ptr(IrType::UInt(64)) } });
+        let ptr_ty: IrTypeRef = Arc::new(IrType::ptr(IrType::UInt(64)));
+        let (ptr_id, ptr_val) = fresh(next_id, Arc::clone(&ptr_ty));
+        stmts.push(Stmt::Assign { lhs: ptr_id, ty: Arc::clone(&ptr_ty),
+            rhs: Expr::Cast { val: acc, to: ptr_ty } });
         (stmts, ptr_val)
     }
 }
@@ -575,21 +584,22 @@ fn lift_lea(
 
     // RIP-relative: resolve to an absolute address at lift time so downstream
     // passes see a plain constant rather than an opaque RIP arithmetic chain.
+    let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
     if expr.base == Some("rip") {
         let rip = insn_address + insn_size as u64;
         let effective = rip.wrapping_add(expr.disp.unwrap_or(0) as u64);
-        let addr_val  = Value::Const { val: effective, ty: Arc::new(IrType::UInt(64)) };
-        let (dst_id, _) = fresh(next_id, IrType::UInt(64));
+        let addr_val  = Value::Const { val: effective, ty: Arc::clone(&u64_ty) };
+        let (dst_id, _) = fresh(next_id, Arc::clone(&u64_ty));
         regs.set(dst, dst_id);
-        return vec![Stmt::Assign { lhs: dst_id, ty: IrType::UInt(64),
+        return vec![Stmt::Assign { lhs: dst_id, ty: u64_ty,
             rhs: Expr::Value(addr_val) }];
     }
 
     let (mut stmts, addr_val) = expr.emit_addr(next_id, regs);
-    let (dst_id, _) = fresh(next_id, IrType::UInt(64));
+    let (dst_id, _) = fresh(next_id, Arc::clone(&u64_ty));
     regs.set(dst, dst_id);
-    stmts.push(Stmt::Assign { lhs: dst_id, ty: IrType::UInt(64),
-        rhs: Expr::Cast { val: addr_val, to: IrType::UInt(64) } });
+    stmts.push(Stmt::Assign { lhs: dst_id, ty: Arc::clone(&u64_ty),
+        rhs: Expr::Cast { val: addr_val, to: u64_ty } });
     stmts
 }
 
@@ -623,17 +633,18 @@ fn lift_binop(
     if op == BinOp::Xor {
         if let (Value::Var { id: la, .. }, Value::Var { id: ra, .. }) = (&lhs_val, &rhs_val) {
             if la == ra {
-                let id = alloc(next_id, IrType::UInt(64));
+                let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
+                let id = alloc(next_id, Arc::clone(&u64_ty));
                 regs.set(dst, id);
-                return vec![Stmt::Assign { lhs: id, ty: IrType::UInt(64),
+                return vec![Stmt::Assign { lhs: id, ty: u64_ty,
                     rhs: Expr::Value(Value::Const { val: 0, ty: Arc::new(IrType::UInt(64)) }) }];
             }
         }
     }
 
     // Core computation.
-    let (res_id, _) = fresh(next_id, result_ty.clone());
-    stmts.push(Stmt::Assign { lhs: res_id, ty: (*result_ty).clone(),
+    let (res_id, _) = fresh(next_id, Arc::clone(&result_ty));
+    stmts.push(Stmt::Assign { lhs: res_id, ty: Arc::clone(&result_ty),
         rhs: Expr::BinOp { op, lhs: lhs_val, rhs: rhs_val } });
 
     // Write-back (cmp / test are flag-only — no destination update).
@@ -642,10 +653,11 @@ fn lift_binop(
     }
 
     // Zero flag: ZF = (result == 0).  Use UInt(8) so codegen emits uint8_t.
+    let u8_ty: IrTypeRef = Arc::new(IrType::UInt(8));
     let res_ref = Value::Var { id: res_id, ty: result_ty.clone() };
-    let (zf_id, _) = fresh(next_id, IrType::UInt(8));
+    let (zf_id, _) = fresh(next_id, Arc::clone(&u8_ty));
     flags.zf = Some(zf_id);
-    stmts.push(Stmt::Assign { lhs: zf_id, ty: IrType::UInt(8),
+    stmts.push(Stmt::Assign { lhs: zf_id, ty: u8_ty,
         rhs: Expr::BinOp { op: BinOp::Eq, lhs: res_ref,
             rhs: Value::Const { val: 0, ty: result_ty } } });
 
@@ -659,27 +671,28 @@ fn lift_binop(
 /// this register will find a signed type and emit the correct cast.
 fn lift_movsx(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
     let src_val = operand_to_val(src, regs);
-    let dst_bits = match reg_type(dst) {
+    let dst_bits = match *reg_type(dst) {
         IrType::UInt(b) | IrType::SInt(b) => b,
         _ => 64,
     };
-    let dst_ty = IrType::SInt(dst_bits);
-    let (new_id, _) = fresh(next_id, dst_ty.clone());
+    let dst_ty: IrTypeRef = Arc::new(IrType::SInt(dst_bits));
+    let (new_id, _) = fresh(next_id, Arc::clone(&dst_ty));
     regs.set(dst, new_id);
     let mut stmts = vec![Stmt::Assign {
-        lhs: new_id, ty: dst_ty.clone(),
-        rhs: Expr::Cast { val: src_val, to: dst_ty.clone() },
+        lhs: new_id, ty: Arc::clone(&dst_ty),
+        rhs: Expr::Cast { val: src_val, to: Arc::clone(&dst_ty) },
     }];
     // x86-64: writing a 32-bit reg zero-extends into the 64-bit counterpart.
     // For sign-extension, keep the signed type all the way to 64 bits so that
     // the 64-bit register also carries SInt — this prevents spurious unsigned
     // casts in codegen when the full-width register is later compared.
     if dst_bits == 32 && is_gp_reg(dst) {
-        let ext_id = alloc(next_id, IrType::SInt(64));
+        let s64: IrTypeRef = Arc::new(IrType::SInt(64));
+        let ext_id = alloc(next_id, Arc::clone(&s64));
         regs.set(&to_64bit_name(dst), ext_id);
         stmts.push(Stmt::Assign {
-            lhs: ext_id, ty: IrType::SInt(64),
-            rhs: Expr::Cast { val: Value::Var { id: new_id, ty: Arc::new(dst_ty) }, to: IrType::SInt(64) },
+            lhs: ext_id, ty: Arc::clone(&s64),
+            rhs: Expr::Cast { val: Value::Var { id: new_id, ty: dst_ty }, to: s64 },
         });
     }
     stmts
@@ -694,17 +707,17 @@ fn lift_movsx(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable)
 fn lift_div(src: &str, next_id: &mut u32, regs: &mut RegisterTable, signed: bool) -> Vec<Stmt> {
     let dividend = reg_val("rax", regs);
     let divisor  = operand_to_val(src, regs);
-    let (quot_op, rem_op, result_ty) = if signed {
-        (BinOp::SDiv, BinOp::SRem, IrType::SInt(64))
+    let (quot_op, rem_op, result_ty): (_, _, IrTypeRef) = if signed {
+        (BinOp::SDiv, BinOp::SRem, Arc::new(IrType::SInt(64)))
     } else {
-        (BinOp::UDiv, BinOp::URem, IrType::UInt(64))
+        (BinOp::UDiv, BinOp::URem, Arc::new(IrType::UInt(64)))
     };
-    let (quot_id, _) = fresh(next_id, result_ty.clone());
-    let (rem_id,  _) = fresh(next_id, result_ty.clone());
+    let (quot_id, _) = fresh(next_id, Arc::clone(&result_ty));
+    let (rem_id,  _) = fresh(next_id, Arc::clone(&result_ty));
     regs.set("rax", quot_id);
     regs.set("rdx", rem_id);
     vec![
-        Stmt::Assign { lhs: quot_id, ty: result_ty.clone(),
+        Stmt::Assign { lhs: quot_id, ty: Arc::clone(&result_ty),
             rhs: Expr::BinOp { op: quot_op, lhs: dividend.clone(), rhs: divisor.clone() } },
         Stmt::Assign { lhs: rem_id, ty: result_ty,
             rhs: Expr::BinOp { op: rem_op,  lhs: dividend,         rhs: divisor } },
@@ -738,10 +751,11 @@ fn lift_call(ops: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt
     };
 
     // Return value lands in rax.
-    let (ret_id, _) = fresh(next_id, IrType::UInt(64));
+    let u64_ty: IrTypeRef = Arc::new(IrType::UInt(64));
+    let (ret_id, _) = fresh(next_id, Arc::clone(&u64_ty));
     regs.set("rax", ret_id);
-    vec![Stmt::Assign { lhs: ret_id, ty: IrType::UInt(64),
-        rhs: Expr::Call { target, args, ret_ty: IrType::UInt(64) } }]
+    vec![Stmt::Assign { lhs: ret_id, ty: Arc::clone(&u64_ty),
+        rhs: Expr::Call { target, args, ret_ty: u64_ty } }]
 }
 
 // ── Operand helpers ───────────────────────────────────────────────────────────
@@ -766,14 +780,14 @@ fn operand_to_val(op: &str, regs: &RegisterTable) -> Value {
     if is_mem(op) {
         // Caller should use operand_ptr_full for a proper load; this path is
         // a fallback for callers that can't emit extra stmts.
-        return Value::Var { id: 9999, ty: Arc::new(infer_mem_type(op)) };
+        return Value::Var { id: 9999, ty: infer_mem_type(op) };
     }
 
     // Register — strip AT&T `%` prefix before lookup.
     let reg = op.trim_start_matches('%');
     let id  = regs.get(reg)
         .unwrap_or_else(|| reg_name_to_placeholder_id(reg));
-    Value::Var { id, ty: Arc::new(reg_type(reg)) }
+    Value::Var { id, ty: reg_type(reg) }
 }
 
 /// Emit stmts for a memory operand's address and return `(stmts, ptr_val)`.
@@ -812,7 +826,7 @@ fn reg_val(reg: &str, regs: &RegisterTable) -> Value {
     let id = regs.get(reg)
         .or_else(|| { let r64 = to_64bit_name(reg); regs.get(&r64) })
         .unwrap_or_else(|| reg_name_to_placeholder_id(reg));
-    Value::Var { id, ty: Arc::new(reg_type(reg)) }
+    Value::Var { id, ty: reg_type(reg) }
 }
 
 /// Map a register name to a stable placeholder SSA id for untracked registers.
@@ -851,7 +865,7 @@ fn fresh(next_id: &mut u32, ty: impl Into<IrTypeRef>) -> (u32, Value) {
     (id, Value::Var { id, ty: ty.into() })
 }
 
-fn alloc(next_id: &mut u32, _ty: IrType) -> u32 {
+fn alloc(next_id: &mut u32, _ty: impl Into<IrTypeRef>) -> u32 {
     let id = *next_id; *next_id += 1; id
 }
 
@@ -866,9 +880,9 @@ fn to_signed(ty: &IrType) -> IrType {
     }
 }
 
-fn reg_type(reg: &str) -> IrType {
+fn reg_type(reg: &str) -> IrTypeRef {
     let r = normalize_reg(reg);
-    if r.starts_with('r') || matches!(r.as_str(), "rsp"|"rbp"|"rip") {
+    Arc::new(if r.starts_with('r') || matches!(r.as_str(), "rsp"|"rbp"|"rip") {
         IrType::UInt(64)
     } else if r.starts_with('e') || matches!(r.as_str(), "esp"|"ebp") {
         IrType::UInt(32)
@@ -878,14 +892,14 @@ fn reg_type(reg: &str) -> IrType {
         IrType::UInt(8)
     } else {
         IrType::UInt(64) // safe default for unknown / r8-r15 variants
-    }
+    })
 }
 
-fn infer_mem_type(op: &str) -> IrType {
-    if op.contains("byte")        { IrType::UInt(8)  }
+fn infer_mem_type(op: &str) -> IrTypeRef {
+    Arc::new(if op.contains("byte")        { IrType::UInt(8)  }
     else if op.contains("word")   { IrType::UInt(16) }
     else if op.contains("dword")  { IrType::UInt(32) }
-    else                          { IrType::UInt(64) }
+    else                          { IrType::UInt(64) })
 }
 
 fn value_type(v: &Value) -> IrTypeRef {

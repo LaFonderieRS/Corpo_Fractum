@@ -564,8 +564,12 @@ fn rewrite_stmt(
             let new_rhs = match rhs {
                 Expr::Load { ptr, ty: load_ty } => {
                     let (new_ptr, slot_ty) = resolve_frame_ptr(
-                        ptr, func, rbp_ids, rsp_ids, def_map, load_ty.clone());
-                    let effective_ty = if slot_ty != IrType::Unknown { slot_ty } else { load_ty };
+                        ptr, func, rbp_ids, rsp_ids, def_map, (*load_ty).clone());
+                    let effective_ty = if slot_ty != IrType::Unknown {
+                        Arc::new(slot_ty)
+                    } else {
+                        load_ty
+                    };
                     Expr::Load { ptr: new_ptr, ty: effective_ty }
                 }
                 other => other,
@@ -809,7 +813,7 @@ fn rewrite_array_accesses(
                     if let Some((name, index)) =
                         try_resolve_array_ptr(&ptr, rbp_ids, def_map, func)
                     {
-                        Stmt::Assign { lhs, ty, rhs: Expr::ArrayAccess { name, index, elem_ty: load_ty } }
+                        Stmt::Assign { lhs, ty, rhs: Expr::ArrayAccess { name, index, elem_ty: (*load_ty).clone() } }
                     } else {
                         Stmt::Assign { lhs, ty, rhs: Expr::Load { ptr, ty: load_ty } }
                     }

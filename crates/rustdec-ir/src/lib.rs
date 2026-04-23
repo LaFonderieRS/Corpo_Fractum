@@ -141,11 +141,11 @@ pub enum Expr {
     /// Binary operation.
     BinOp { op: BinOp, lhs: Value, rhs: Value },
     /// Memory load: `*ptr`.
-    Load { ptr: Value, ty: IrType },
+    Load { ptr: Value, ty: IrTypeRef },
     /// Function call.
-    Call { target: CallTarget, args: Vec<Value>, ret_ty: IrType },
+    Call { target: CallTarget, args: Vec<Value>, ret_ty: IrTypeRef },
     /// Type cast / bit-cast.
-    Cast { val: Value, to: IrType },
+    Cast { val: Value, to: IrTypeRef },
     /// Unresolved / opaque expression.
     Opaque(String),
     /// Resolved symbolic reference — a string literal, function, or global
@@ -179,7 +179,7 @@ pub enum CallTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Stmt {
     /// `v{id} = expr`
-    Assign { lhs: u32, ty: IrType, rhs: Expr },
+    Assign { lhs: u32, ty: IrTypeRef, rhs: Expr },
     /// `*ptr = val`
     Store { ptr: Value, val: Value },
     /// `name[index] = val` — array element store (produced by array-recognition pass).

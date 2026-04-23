@@ -67,7 +67,7 @@ impl CodegenBackend for CBackend {
         for bb in &blocks {
             for stmt in &bb.stmts {
                 if let Stmt::Assign { lhs, ty, rhs } = stmt {
-                    var_decls.entry(*lhs).or_insert_with(|| ty.clone());
+                    var_decls.entry(*lhs).or_insert_with(|| (**ty).clone());
                     *assign_count.entry(*lhs).or_insert(0) += 1;
                     written_vars.insert(*lhs);
                     if let Expr::Value(v) = rhs {
@@ -605,7 +605,7 @@ impl CBackend {
 
                 let call_expr = format!("{tgt}({})", filtered.join(", "));
                 if let Some(sig) = known_sig {
-                    if sig.ret != *ret_ty && sig.ret != rustdec_ir::IrType::Void {
+                    if sig.ret != **ret_ty && sig.ret != rustdec_ir::IrType::Void {
                         return format!("({}){call_expr}", self.emit_type(&sig.ret));
                     }
                 }
@@ -617,7 +617,7 @@ impl CBackend {
                 let inner = display_value(v, copies, slots, reg_names);
                 // Suppress redundant casts between integer types of the same
                 // or compatible widths — (int)printf() → printf().
-                let suppress = match (v.ty(), to) {
+                let suppress = match (v.ty(), &**to) {
                     (IrType::SInt(a), IrType::SInt(b))   => a == b,
                     (IrType::UInt(a), IrType::UInt(b))   => a == b,
                     (IrType::SInt(a), IrType::UInt(b))   => a == b,

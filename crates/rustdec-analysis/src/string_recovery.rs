@@ -730,7 +730,7 @@ mod tests {
         let mut bb = BasicBlock::new(0, 0x401000);
         bb.stmts.push(Stmt::Assign {
             lhs: 0,
-            ty: IrType::UInt(64),
+            ty: IrType::UInt(64).into(),
             rhs: Expr::Value(Value::Const { val: addr, ty: Arc::new(IrType::UInt(64)) }),
         });
         bb.terminator = Terminator::Return(None);
@@ -777,7 +777,7 @@ mod tests {
         let mut bb = BasicBlock::new(0, 0x401000);
         bb.stmts.push(Stmt::Assign {
             lhs: 1,
-            ty: IrType::UInt(64),
+            ty: IrType::UInt(64).into(),
             rhs: Expr::Value(Value::Var { id: 0, ty: Arc::new(IrType::UInt(64)) }),
         });
         bb.terminator = Terminator::Return(None);
@@ -797,7 +797,7 @@ mod tests {
         let mut bb0 = BasicBlock::new(0, 0x401000);
         bb0.stmts.push(Stmt::Assign {
             lhs: 0,
-            ty: IrType::UInt(64),
+            ty: IrType::UInt(64).into(),
             rhs: Expr::Value(Value::Const { val: 0x402010, ty: Arc::new(IrType::UInt(64)) }),
         });
         bb0.terminator = Terminator::Jump(1);
@@ -805,7 +805,7 @@ mod tests {
         let mut bb1 = BasicBlock::new(1, 0x401010);
         bb1.stmts.push(Stmt::Assign {
             lhs: 1,
-            ty: IrType::UInt(64),
+            ty: IrType::UInt(64).into(),
             rhs: Expr::Value(Value::Const { val: 0x402020, ty: Arc::new(IrType::UInt(64)) }),
         });
         bb1.terminator = Terminator::Return(None);
