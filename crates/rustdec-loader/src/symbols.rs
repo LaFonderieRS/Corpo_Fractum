@@ -18,6 +18,7 @@
 //! is treated as a string, not a global variable.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{BinaryObject, StringTable, SymbolKind as LoaderSymbolKind};
 
@@ -40,7 +41,7 @@ pub enum SymbolMapKind {
 pub struct SymbolEntry {
     /// Display name.  For strings this is the decoded text content;
     /// for functions and globals it is the symbol identifier.
-    pub name: String,
+    pub name: Arc<str>,
     /// How this symbol should be rendered by codegen.
     pub kind: SymbolMapKind,
 }
@@ -60,7 +61,7 @@ pub fn build_symbol_map(obj: &BinaryObject, strings: &StringTable) -> SymbolMap 
     // ── 1. String literals (highest priority) ────────────────────────────────
     for (&addr, content) in strings {
         map.insert(addr, SymbolEntry {
-            name: content.clone(),
+            name: Arc::from(content.as_str()),
             kind: SymbolMapKind::String,
         });
     }
@@ -70,7 +71,7 @@ pub fn build_symbol_map(obj: &BinaryObject, strings: &StringTable) -> SymbolMap 
         for func in &dwarf.functions {
             if func.low_pc == 0 { continue; }
             map.entry(func.low_pc).or_insert(SymbolEntry {
-                name: func.name.clone(),
+                name: Arc::from(func.name.as_str()),
                 kind: SymbolMapKind::Function,
             });
         }
@@ -79,6 +80,10 @@ pub fn build_symbol_map(obj: &BinaryObject, strings: &StringTable) -> SymbolMap 
     // ── 3. Symbol table ───────────────────────────────────────────────────────
     for sym in &obj.symbols {
         if sym.name.is_empty() { continue; }
+        // Skip symbols at address 0 — these are unresolved dynamic imports
+        // (st_value == 0 in the dynsym table before relocation).  The real
+        // PLT stubs added by extract_plt_symbols carry the correct addresses.
+        if sym.address == 0 { continue; }
         let kind = match sym.kind {
             LoaderSymbolKind::Function
             | LoaderSymbolKind::Import
@@ -87,7 +92,7 @@ pub fn build_symbol_map(obj: &BinaryObject, strings: &StringTable) -> SymbolMap 
             | LoaderSymbolKind::Other   => SymbolMapKind::Global,
         };
         map.entry(sym.address).or_insert(SymbolEntry {
-            name: sym.name.clone(),
+            name: Arc::from(sym.name.as_str()),
             kind,
         });
     }

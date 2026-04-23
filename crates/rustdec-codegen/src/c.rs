@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use rustdec_analysis::{structure_function, CondExpr, SNode};
 use rustdec_lift::frame::{is_slot_id, slot_id_to_offset};
-use rustdec_ir::{BinOp, BasicBlock, CallTarget, Expr, IrFunction, IrType, SymbolKind, Stmt, Terminator, Value};
+use rustdec_ir::{BinOp, BasicBlock, CallTarget, Expr, IrFunction, IrType, SlotOrigin, SymbolKind, Stmt, Terminator, Value};
 use tracing::{debug, trace, warn};
 
 use crate::{CodegenBackend, CodegenResult, libc_signatures, syscalls};
@@ -24,13 +24,12 @@ pub struct CBackend {
 
 impl CodegenBackend for CBackend {
     fn emit_function(&self, func: &IrFunction) -> CodegenResult<String> {
-        // If this function has a known libc / CRT signature and the inferred
-        // arity matches, use the known types and parameter names directly.
-        // This turns `uint64_t main(uint64_t a0, uint64_t a1)` into
-        // `int main(int argc, char** argv)` without any extra passes.
-        let known_sig = libc_signatures::lookup(&func.name)
-            .filter(|s| s.params.len() == func.params.len()
-                        || func.params.is_empty() && s.params.is_empty());
+        // If this function has a known libc / CRT signature, always prefer it
+        // over the inferred arity — the table is authoritative.
+        // This turns `uint64_t main(uint64_t a0, …)` into
+        // `int main(int argc, char** argv)` regardless of how many args
+        // were inferred.
+        let known_sig = libc_signatures::lookup(&func.name);
 
         let ret = if let Some(sig) = known_sig {
             self.emit_type(&sig.ret)
@@ -94,13 +93,80 @@ impl CodegenBackend for CBackend {
         out.push_str(&format!("// RustDec decompilation — {}\n", func.name));
         out.push_str(&format!("{ret} {}({params}) {{\n", sanitise_name(&func.name)));
 
+        // ── Refine call return types using known signatures ──────────────────
+        // When a function has a known libc signature, the lhs of its call
+        // was declared as UInt(64) by the lifter.  Update var_decls to use
+        // the actual return type so `int v20` is emitted instead of
+        // `uint64_t v20`.
+        for bb in &blocks {
+            for stmt in &bb.stmts {
+                if let Stmt::Assign { lhs, rhs: Expr::Call { target: CallTarget::Named(n), .. }, .. } = stmt {
+                    if let Some(sig) = libc_signatures::lookup(n) {
+                        if sig.ret != IrType::Void && sig.ret != IrType::Unknown {
+                            var_decls.insert(*lhs, sig.ret.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Emit slot declarations (local variables, hoisted) ─────────────────
+        // Collect base offsets of recognised arrays to suppress their element slots.
+        let array_bases: std::collections::HashSet<i64> = func.slot_table
+            .iter()
+            .filter(|(_, s)| s.array_info.is_some())
+            .map(|(off, _)| *off)
+            .collect();
+        let array_member_offsets: std::collections::HashSet<i64> = func.slot_table
+            .iter()
+            .filter(|(off, s)| {
+                matches!(s.origin, SlotOrigin::Local)
+                    && s.array_info.is_none()
+                    && !array_bases.contains(off)
+            })
+            .filter_map(|(off, s)| {
+                // Suppress this slot if a base array covers it.
+                let ty_size = s.ty.byte_size().unwrap_or(0) as i64;
+                if ty_size == 0 { return None; }
+                for &base_off in &array_bases {
+                    let base_slot = func.slot_table.get(&base_off)?;
+                    let info = base_slot.array_info.as_ref()?;
+                    let stride = info.stride as i64;
+                    let count  = info.count as i64;
+                    // Element offsets: base_off, base_off+stride, ..., base_off+(count-1)*stride
+                    for k in 1..count {
+                        if *off == base_off + stride * k { return Some(*off); }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        let mut slot_decls: Vec<String> = func.slot_table
+            .values()
+            .filter(|s| matches!(s.origin, SlotOrigin::Local))
+            .filter(|s| !matches!(s.ty, IrType::Unknown))
+            .filter(|s| !array_member_offsets.contains(&s.rbp_offset))
+            .map(|s| {
+                if let Some(info) = &s.array_info {
+                    format!("  {} {}[{}];", self.emit_type(&s.ty), s.name, info.count)
+                } else {
+                    format!("  {} {};", self.emit_type(&s.ty), s.name)
+                }
+            })
+            .collect();
+        slot_decls.sort();
+        if !slot_decls.is_empty() {
+            for line in &slot_decls { out.push_str(line); out.push('\n'); }
+            out.push('\n');
+        }
+
         // ── Emit variable declarations (hoisted) ──────────────────────────────
         let mut decl_lines: Vec<String> = var_decls
             .iter()
             .filter(|(id, _)| {
                 !suppressed.contains(id)
                     && !is_slot_id(**id)
-                    && !func.reg_names.contains_key(id)
             })
             .map(|(id, ty)| format!("  {} v{id};", self.emit_type(ty)))
             .collect();
@@ -110,12 +176,31 @@ impl CodegenBackend for CBackend {
             out.push('\n');
         }
 
+        // ── Build codegen register-name map ──────────────────────────────────
+        // Only ABI parameter registers (rdi, rsi, rdx, rcx, r8, r9) are mapped
+        // to their C parameter names.  Non-parameter registers (rax, rsp, rbp,
+        // etc.) are excluded so they fall back to v{id} in display_value
+        // instead of leaking raw register names into the C output.
+        const PARAM_REGS: &[&str] = &["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+        let param_names: Vec<String> = if let Some(sig) = known_sig {
+            sig.params.iter().map(|p| p.name.to_string()).collect()
+        } else {
+            (0..func.params.len()).map(|i| format!("a{i}")).collect()
+        };
+        let mut codegen_reg_names: HashMap<u32, String> = HashMap::new();
+        for (id, reg) in &func.reg_names {
+            if let Some(idx) = PARAM_REGS.iter().position(|r| *r == reg.as_str()) {
+                if let Some(pname) = param_names.get(idx) {
+                    codegen_reg_names.insert(*id, pname.clone());
+                }
+            }
+        }
+
         // ── Emit structured body ──────────────────────────────────────────────
         let structured = structure_function(func);
         let slots     = &func.slot_table;
-        let reg_names = &func.reg_names;
         self.emit_node(&structured.root, &structured, &copy_table,
-                       &written_vars, slots, reg_names, &mut out, 1);
+                       &written_vars, slots, &codegen_reg_names, &mut out, 1);
 
         out.push_str("}\n");
         debug!(func = %func.name, lines = out.lines().count(),
@@ -126,13 +211,13 @@ impl CodegenBackend for CBackend {
 
     fn emit_type(&self, ty: &IrType) -> String {
         match ty {
-            IrType::UInt(8)             => "uint8_t".into(),
+            IrType::UInt(8)             => "char".into(),
             IrType::UInt(16)            => "uint16_t".into(),
             IrType::UInt(32)            => "uint32_t".into(),
             IrType::UInt(64)            => "uint64_t".into(),
             IrType::SInt(8)             => "int8_t".into(),
             IrType::SInt(16)            => "int16_t".into(),
-            IrType::SInt(32)            => "int32_t".into(),
+            IrType::SInt(32)            => "int".into(),
             IrType::SInt(64)            => "int64_t".into(),
             IrType::Float(32)           => "float".into(),
             IrType::Float(64)           => "double".into(),
@@ -241,8 +326,17 @@ impl CBackend {
             }
 
             SNode::Seq(nodes) => {
+                let before = out.len();
                 for n in nodes {
+                    let len_before = out.len();
                     self.emit_node(n, sfunc, copies, written, slots, reg_names, out, depth);
+                    // Stop after a node that emitted a return statement —
+                    // any subsequent nodes in this Seq are unreachable.
+                    let added = &out[len_before..];
+                    if added.contains("return") {
+                        break;
+                    }
+                    let _ = before;
                 }
             }
 
@@ -315,6 +409,14 @@ impl CBackend {
                 let ptr_s = display_value(ptr_r, copies, slots, reg_names);
                 let val_s = display_value(val_r, copies, slots, reg_names);
                 Some(format!("*({ptr_s}) = {val_s}"))
+            }
+
+            Stmt::ArrayStore { name, index, val } => {
+                let idx_r = resolve(index, copies);
+                let val_r = resolve(val, copies);
+                let idx_s = display_value(idx_r, copies, slots, reg_names);
+                let val_s = display_value(val_r, copies, slots, reg_names);
+                Some(format!("{name}[{idx_s}] = {val_s}"))
             }
         }
     }
@@ -451,7 +553,7 @@ impl CBackend {
                 // The lifter emits `__syscall(nr, rdi, rsi, rdx, r10, r8, r9)`.
                 // We look up the nr (args[0]) and emit `syscall(SYS_xxx, ...)`.
                 if let CallTarget::Named(n) = target {
-                    if n == "__syscall" {
+                    if &**n == "__syscall" {
                         return self.emit_syscall(args, copies, written, slots, reg_names);
                     }
                 }
@@ -460,7 +562,7 @@ impl CBackend {
                     CallTarget::Direct(a)   => (format!("sub_{a:x}"), None),
                     CallTarget::Named(n)    => {
                         let sig = libc_signatures::lookup(n);
-                        (n.clone(), sig)
+                        (n.to_string(), sig)
                     }
                     CallTarget::Indirect(v) => {
                         let r = resolve(v, copies);
@@ -512,16 +614,38 @@ impl CBackend {
 
             Expr::Cast { val, to } => {
                 let v = resolve(val, copies);
-                format!("({}){}", self.emit_type(to), display_value(v, copies, slots, reg_names))
+                let inner = display_value(v, copies, slots, reg_names);
+                // Suppress redundant casts between integer types of the same
+                // or compatible widths — (int)printf() → printf().
+                let suppress = match (v.ty(), to) {
+                    (IrType::SInt(a), IrType::SInt(b))   => a == b,
+                    (IrType::UInt(a), IrType::UInt(b))   => a == b,
+                    (IrType::SInt(a), IrType::UInt(b))   => a == b,
+                    (IrType::UInt(a), IrType::SInt(b))   => a == b,
+                    (IrType::UInt(64), IrType::SInt(32)) => true, // common retval pattern
+                    (IrType::SInt(32), IrType::UInt(64)) => true,
+                    _ => false,
+                };
+                if suppress {
+                    inner
+                } else {
+                    format!("({}){}", self.emit_type(to), inner)
+                }
             }
 
             Expr::Opaque(s) => format!("/* {s} */"),
 
             Expr::Symbol { kind, name, .. } => match kind {
                 SymbolKind::String   => format!("\"{}\"", escape_c_string(name)),
-                SymbolKind::Function => name.clone(),
-                SymbolKind::Global   => name.clone(),
+                SymbolKind::Function => name.to_string(),
+                SymbolKind::Global   => name.to_string(),
             },
+
+            Expr::ArrayAccess { name, index, .. } => {
+                let idx_r = resolve(index, copies);
+                let idx_s = display_value(idx_r, copies, slots, reg_names);
+                format!("{name}[{idx_s}]")
+            }
         }
     }
 }

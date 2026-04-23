@@ -6,6 +6,9 @@ members = [
     "crates/rustdec-ir",
     "crates/rustdec-analysis",
     "crates/rustdec-codegen",
+    "crates/rustdec-tests",
+    "crates/rustdec-bench",
+    "rustdec-cli",
     "rustdec-gui",
 ]
 resolver = "2"
@@ -14,7 +17,7 @@ resolver = "2"
 version     = "0.1.0"
 edition     = "2021"
 authors     = ["Corpo Fractum Contributors"]
-license     = "GPL 3.0"
+license     = "GPL 3.0 (CLI and GUI), LGPL 3.0 (core)"
 rust-version = "1.78"
 
 [workspace.dependencies]
@@ -35,7 +38,7 @@ tokio = { version = "1", features = ["full"] }
 rayon = "1"
 
 # Serialization
-serde       = { version = "1", features = ["derive"] }
+serde       = { version = "1", features = ["derive", "rc"] }
 serde_json  = "1"
 
 # Error handling

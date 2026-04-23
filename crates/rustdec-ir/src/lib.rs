@@ -14,7 +14,30 @@
 
 use petgraph::graph::DiGraph;
 use std::collections::HashMap;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+
+// ── Provenance ────────────────────────────────────────────────────────────────
+
+/// Source of a name or type annotation on an IR node.
+///
+/// Drives conflict resolution in the DWARF annotation pass: a `Dwarf`-origin
+/// name/type wins over `Auto` but never silently overwrites `User`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Provenance {
+    /// Automatically derived by the lifter (e.g. `local_0`, `arg_0`).
+    Auto,
+    /// Heuristically inferred (e.g. type narrowed from access size).
+    Inferred,
+    /// Populated from DWARF debug info.
+    Dwarf,
+    /// Set by the user (highest priority — never overwritten automatically).
+    User,
+}
+
+impl Default for Provenance {
+    fn default() -> Self { Self::Auto }
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -59,18 +82,25 @@ impl IrType {
 
 // ── Values ────────────────────────────────────────────────────────────────────
 
+/// Reference-counted handle to an [`IrType`].
+///
+/// Cloning an `IrTypeRef` is a single atomic reference-count increment rather
+/// than a deep copy of the type graph.  This matters in the x86 lifter, where
+/// each instruction can emit 5–30 `Value` copies that all carry the same type.
+pub type IrTypeRef = Arc<IrType>;
+
 /// A value: either a variable reference or an immediate constant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
     /// SSA variable, uniquely identified by (function-scoped) index.
-    Var { id: u32, ty: IrType },
+    Var { id: u32, ty: IrTypeRef },
     /// Integer constant.
-    Const { val: u64, ty: IrType },
+    Const { val: u64, ty: IrTypeRef },
 }
 
 impl Value {
     pub fn ty(&self) -> &IrType {
-        match self { Self::Var { ty, .. } | Self::Const { ty, .. } => ty }
+        match self { Self::Var { ty, .. } | Self::Const { ty, .. } => &**ty }
     }
 
     pub fn display(&self) -> String {
@@ -125,7 +155,12 @@ pub enum Expr {
     /// - `kind`: semantic classification; drives codegen output.
     /// - `name`: for `String` — decoded text content;
     ///           for `Function` / `Global` — the symbol identifier.
-    Symbol { addr: u64, kind: SymbolKind, name: String },
+    Symbol { addr: u64, kind: SymbolKind, name: Arc<str> },
+    /// Indexed access into a named stack array: `name[index]`.
+    ///
+    /// Produced by the array-recognition pass in `rustdec-lift` when a
+    /// pointer expression decomposes as `array_base + index * stride`.
+    ArrayAccess { name: String, index: Value, elem_ty: IrType },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,7 +170,7 @@ pub enum CallTarget {
     /// Indirect call through a computed value.
     Indirect(Value),
     /// Call to a named import/symbol.
-    Named(String),
+    Named(Arc<str>),
 }
 
 // ── Statements ────────────────────────────────────────────────────────────────
@@ -147,6 +182,8 @@ pub enum Stmt {
     Assign { lhs: u32, ty: IrType, rhs: Expr },
     /// `*ptr = val`
     Store { ptr: Value, val: Value },
+    /// `name[index] = val` — array element store (produced by array-recognition pass).
+    ArrayStore { name: String, index: Value, val: Value },
     /// No-op (removed instruction).
     Nop,
 }
@@ -190,6 +227,15 @@ pub enum SlotOrigin {
     Unknown,
 }
 
+/// Metadata attached to the base slot of a recognised stack array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArrayInfo {
+    /// Number of contiguous elements (≥ 2).
+    pub count:  u32,
+    /// Element size in bytes.
+    pub stride: u32,
+}
+
 /// A named, typed slot in the function's stack frame.
 ///
 /// The lifter creates one `StackSlot` for every distinct `[rbp ± offset]`
@@ -205,6 +251,17 @@ pub struct StackSlot {
     pub name:       String,
     /// How we think this slot is used.
     pub origin:     SlotOrigin,
+    /// Set on the *base* slot when this slot is the first element of a
+    /// contiguous stack array.  Non-base element slots are suppressed in
+    /// codegen (the base declaration covers them).
+    #[serde(default)]
+    pub array_info: Option<ArrayInfo>,
+    /// Origin of `name` (Auto = lifter-generated, Dwarf = from debug info).
+    #[serde(default)]
+    pub name_provenance: Provenance,
+    /// Origin of `ty` (Auto = heuristic, Inferred = access-size, Dwarf = debug info).
+    #[serde(default)]
+    pub ty_provenance:   Provenance,
 }
 
 // ── Basic Block ───────────────────────────────────────────────────────────────
@@ -251,15 +308,29 @@ pub type CfgGraph = DiGraph<BasicBlock, CfgEdge>;
 pub struct IrFunction {
     /// Demangled name (may be synthetic like `sub_<addr>`).
     pub name:        String,
+    /// Origin of `name`.
+    #[serde(default)]
+    pub name_provenance: Provenance,
     /// Entry virtual address.
     pub entry_addr:  u64,
+    /// Exclusive end virtual address (first byte past the function body).
+    /// Zero when unknown (e.g. manually constructed functions).
+    #[serde(default)]
+    pub end_addr:    u64,
     /// Control-flow graph.  Node weights are [`BasicBlock`].
     #[serde(skip)]
     pub cfg:         CfgGraph,
     /// Parameter types (may be [`IrType::Unknown`] if not inferred).
     pub params:      Vec<IrType>,
+    /// DWARF-derived parameter names, parallel to `params`.
+    /// `None` at a given index means the name is still auto-generated.
+    #[serde(default)]
+    pub param_names: Vec<Option<String>>,
     /// Return type.
     pub ret_ty:      IrType,
+    /// Origin of `ret_ty`.
+    #[serde(default)]
+    pub ret_ty_provenance: Provenance,
     /// Next SSA variable index (monotonically increasing).
     pub next_var_id: u32,
     /// Stack frame slots discovered during lifting.
@@ -278,27 +349,51 @@ pub struct IrFunction {
 impl IrFunction {
     pub fn new(name: impl Into<String>, entry_addr: u64) -> Self {
         Self {
-            name:        name.into(),
+            name:             name.into(),
+            name_provenance:  Provenance::Auto,
             entry_addr,
-            cfg:         CfgGraph::new(),
-            params:      vec![],
-            ret_ty:      IrType::Unknown,
-            next_var_id: 0,
-            slot_table:  HashMap::new(),
-            frame_size:  0,
-            reg_names:   HashMap::new(),
+            end_addr:         0,
+            cfg:              CfgGraph::new(),
+            params:           vec![],
+            param_names:      vec![],
+            ret_ty:           IrType::Unknown,
+            ret_ty_provenance: Provenance::Auto,
+            next_var_id:      0,
+            slot_table:       HashMap::new(),
+            frame_size:       0,
+            reg_names:        HashMap::new(),
         }
     }
 
     /// Look up the stack slot for a given rbp offset, or create a new one.
     ///
-    /// `ty` is used only when creating a new slot — existing slots keep their
-    /// previously inferred type.
+    /// If the slot already exists and its type is `Unknown` or the generic
+    /// `UInt(64)` fallback, it is refined to `ty` (the actual access type).
+    /// For `Local`-origin slots, `UInt(32)` is promoted to `SInt(32)` because
+    /// 32-bit locals are almost always C `int`.
     pub fn get_or_insert_slot(&mut self, rbp_offset: i64, ty: IrType) -> &mut StackSlot {
-        self.slot_table.entry(rbp_offset).or_insert_with(|| {
+        let slot = self.slot_table.entry(rbp_offset).or_insert_with(|| {
             let (name, origin) = classify_slot(rbp_offset);
-            StackSlot { rbp_offset, ty, name, origin }
-        })
+            StackSlot {
+                rbp_offset,
+                ty:               IrType::Unknown,
+                name,
+                origin,
+                array_info:       None,
+                name_provenance:  Provenance::Auto,
+                ty_provenance:    Provenance::Auto,
+            }
+        });
+        if slot.ty == IrType::Unknown
+            || (slot.ty == IrType::UInt(64) && ty != IrType::Unknown)
+        {
+            slot.ty = if matches!(slot.origin, SlotOrigin::Local) && ty == IrType::UInt(32) {
+                IrType::SInt(32)
+            } else {
+                ty
+            };
+        }
+        slot
     }
 
     /// Allocate a fresh SSA variable id.

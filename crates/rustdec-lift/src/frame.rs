@@ -44,8 +44,9 @@
 //! - Type inference is heuristic: slot type defaults to `UInt(64)` unless the
 //!   access size can be read from the `IrType` of the `Load`/`Store`.
 
-use rustdec_ir::{BinOp, Expr, IrFunction, IrType, Stmt, Terminator, Value};
-use std::collections::HashMap;
+use rustdec_ir::{ArrayInfo, BinOp, CallTarget, Expr, IrFunction, IrType, SlotOrigin, Stmt, Terminator, Value};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, trace};
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -77,6 +78,12 @@ pub fn analyse_frame(func: &mut IrFunction) {
 
     // ── Step 4: discover slots + rewrite expressions ──────────────────────────
     rewrite_frame_accesses(func, &rbp_ids, &rsp_ids, &def_map);
+
+    // ── Step 5: recognise contiguous stack arrays ─────────────────────────────
+    detect_arrays(func);
+
+    // ── Step 6: rewrite indexed array accesses ────────────────────────────────
+    rewrite_array_accesses(func, &rbp_ids, &def_map);
 
     debug!(func  = %func.name,
            slots = func.slot_table.len(),
@@ -549,13 +556,15 @@ fn rewrite_stmt(
 ) -> Stmt {
     match stmt {
         Stmt::Store { ptr, val } => {
-            let (new_ptr, _) = resolve_frame_ptr(ptr, func, rbp_ids, rsp_ids, def_map);
+            let access_ty = val.ty().clone();
+            let (new_ptr, _) = resolve_frame_ptr(ptr, func, rbp_ids, rsp_ids, def_map, access_ty);
             Stmt::Store { ptr: new_ptr, val }
         }
         Stmt::Assign { lhs, ty, rhs } => {
             let new_rhs = match rhs {
                 Expr::Load { ptr, ty: load_ty } => {
-                    let (new_ptr, slot_ty) = resolve_frame_ptr(ptr, func, rbp_ids, rsp_ids, def_map);
+                    let (new_ptr, slot_ty) = resolve_frame_ptr(
+                        ptr, func, rbp_ids, rsp_ids, def_map, load_ty.clone());
                     let effective_ty = if slot_ty != IrType::Unknown { slot_ty } else { load_ty };
                     Expr::Load { ptr: new_ptr, ty: effective_ty }
                 }
@@ -569,47 +578,52 @@ fn rewrite_stmt(
 
 /// Try to resolve `ptr` to a named frame slot.
 ///
+/// `access_ty` is the type of the actual memory access — `val.ty()` for a
+/// Store, `load_ty` for a Load.  It is passed to `get_or_insert_slot` so the
+/// slot table accumulates the most precise type seen across all accesses.
+///
 /// Resolution order:
 /// 1. rbp ± K → local / arg slot
 /// 2. rsp ± K → converted to rbp-relative using `frame_size`
 /// 3. rsp ± K with `frame_size == 0` → red-zone local (leaf function)
 fn resolve_frame_ptr(
-    ptr:     Value,
-    func:    &mut IrFunction,
-    rbp_ids: &[u32],
-    rsp_ids: &[u32],
-    def_map: &HashMap<u32, Expr>,
+    ptr:       Value,
+    func:      &mut IrFunction,
+    rbp_ids:   &[u32],
+    rsp_ids:   &[u32],
+    def_map:   &HashMap<u32, Expr>,
+    access_ty: IrType,
 ) -> (Value, IrType) {
     // ── rbp-relative ─────────────────────────────────────────────────────────
     if let Some(rbp_off) = resolve_offset(&ptr, rbp_ids, def_map) {
-        let ty   = access_type_from_ptr(&ptr);
-        let slot = func.get_or_insert_slot(rbp_off, ty.clone());
-        let name = slot.name.clone();
+        let slot    = func.get_or_insert_slot(rbp_off, access_ty);
+        let slot_ty = slot.ty.clone();
+        let name    = slot.name.clone();
         trace!(func = %func.name, slot = %name, offset = rbp_off,
                "frame slot resolved (rbp-relative)");
-        return (slot_ptr_val(rbp_off), ty);
+        return (slot_ptr_val(rbp_off), slot_ty);
     }
 
     // ── rsp-relative ─────────────────────────────────────────────────────────
     if let Some(rsp_off) = resolve_offset(&ptr, rsp_ids, def_map) {
-        let ty = access_type_from_ptr(&ptr);
-
         if func.frame_size > 0 {
             // Standard frame: rsp = rbp - frame_size → [rsp + K] = [rbp - (frame_size - K)]
             let rbp_off = -(func.frame_size as i64) + rsp_off;
-            let slot = func.get_or_insert_slot(rbp_off, ty.clone());
-            let name = slot.name.clone();
+            let slot    = func.get_or_insert_slot(rbp_off, access_ty);
+            let slot_ty = slot.ty.clone();
+            let name    = slot.name.clone();
             trace!(func = %func.name, slot = %name,
                    rsp_off, rbp_off, "rsp-relative slot → rbp-relative");
-            return (slot_ptr_val(rbp_off), ty);
+            return (slot_ptr_val(rbp_off), slot_ty);
         } else if rsp_off < 0 {
             // Red zone: leaf function, no sub rsp.  rsp is the frame base.
             // [rsp - K] is equivalent to [entry_rsp - K] = local slot.
-            let slot = func.get_or_insert_slot(rsp_off, ty.clone());
-            let name = slot.name.clone();
+            let slot    = func.get_or_insert_slot(rsp_off, access_ty);
+            let slot_ty = slot.ty.clone();
+            let name    = slot.name.clone();
             trace!(func = %func.name, slot = %name,
                    rsp_off, "red-zone slot (leaf function)");
-            return (slot_ptr_val(rsp_off), ty);
+            return (slot_ptr_val(rsp_off), slot_ty);
         }
     }
 
@@ -618,21 +632,13 @@ fn resolve_frame_ptr(
 
 // ── Offset helpers ────────────────────────────────────────────────────────────
 
-/// Try to read the pointee type from a pointer value's type annotation.
-fn access_type_from_ptr(ptr: &Value) -> IrType {
-    match ptr.ty() {
-        IrType::Ptr(inner) => *inner.clone(),
-        _ => IrType::UInt(64),
-    }
-}
-
 /// Build a stable symbolic `Value` for a slot at `rbp_offset`.
 ///
 /// Ids 10_000..20_000 are reserved for slot pointers.
 /// Encoding: id = 10_000 + (offset + 4096) keeps the range positive.
 pub fn slot_ptr_val(rbp_offset: i64) -> Value {
     let id = (10_000i64 + rbp_offset + 4096) as u32;
-    Value::Var { id, ty: IrType::ptr(IrType::UInt(64)) }
+    Value::Var { id, ty: Arc::new(IrType::ptr(IrType::UInt(64))) }
 }
 
 /// Inverse: given a slot var id, recover the rbp_offset.
@@ -643,6 +649,261 @@ pub fn slot_id_to_offset(id: u32) -> i64 {
 /// Return true if this id is a slot var.
 pub fn is_slot_id(id: u32) -> bool {
     id >= 10_000 && id < 20_000
+}
+
+// ── Stack canary elimination ──────────────────────────────────────────────────
+
+/// Remove the `-fstack-protector` canary epilogue from `func`.
+///
+/// After `copy_propagate_slots`, the canary slot itself is already gone.
+/// What remains is:
+/// 1. A block that calls `__stack_chk_fail` (the fail path).
+/// 2. A predecessor block whose `Branch` terminator has one arm pointing at
+///    that block and the other arm continuing to the normal return path.
+///
+/// This pass:
+/// - Nops all statements in the `__stack_chk_fail` block and marks it
+///   `Unreachable`.
+/// - Converts the predecessor's `Branch` terminator to an unconditional
+///   `Jump` to the normal successor.
+/// - Removes the now-dead CFG edge so the structure analyser does not emit
+///   a spurious `if` branch.
+///
+/// DCE (run by the caller after this pass) then cleans up the comparison
+/// and flag assignments that became dead when the conditional was removed.
+pub fn eliminate_canary(func: &mut IrFunction) {
+    use petgraph::visit::NodeIndexable;
+
+    let node_count = func.cfg.node_count();
+
+    // ── Phase 1: find blocks that call __stack_chk_fail ──────────────────────
+    let mut fail_nodes: HashSet<petgraph::graph::NodeIndex> = HashSet::new();
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            if let Stmt::Assign {
+                rhs: Expr::Call { target: CallTarget::Named(name), .. }, ..
+            } = stmt {
+                if &**name == "__stack_chk_fail" {
+                    fail_nodes.insert(idx);
+                    break;
+                }
+            }
+        }
+    }
+
+    if fail_nodes.is_empty() { return; }
+
+    // ── Phase 2: collect (predecessor, fail_node) pairs to fix ───────────────
+    // Collect first to avoid borrow conflicts during mutation.
+    let mut patches: Vec<(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex)> = Vec::new();
+    for &fail_ni in &fail_nodes {
+        let preds: Vec<_> = func.cfg
+            .neighbors_directed(fail_ni, petgraph::Direction::Incoming)
+            .collect();
+        for pred_ni in preds {
+            patches.push((pred_ni, fail_ni));
+        }
+    }
+
+    // ── Phase 3: fix predecessor branch → unconditional jump ─────────────────
+    for (pred_ni, fail_ni) in patches {
+        let fail_block_id = func.cfg[fail_ni].id;
+
+        // Collect the non-fail successor id before mutating the terminator.
+        let other_bb = match &func.cfg[pred_ni].terminator {
+            Terminator::Branch { _true_bb, _false_bb, .. } => {
+                if *_true_bb == fail_block_id { *_false_bb } else { *_true_bb }
+            }
+            _ => continue, // unexpected — leave as-is
+        };
+
+        func.cfg[pred_ni].terminator = Terminator::Jump(other_bb);
+
+        // Remove the CFG edge so the structure analyser sees the updated graph.
+        if let Some(ei) = func.cfg.find_edge(pred_ni, fail_ni) {
+            func.cfg.remove_edge(ei);
+        }
+    }
+
+    // ── Phase 4: nop fail blocks ──────────────────────────────────────────────
+    for fail_ni in fail_nodes {
+        for stmt in &mut func.cfg[fail_ni].stmts {
+            *stmt = Stmt::Nop;
+        }
+        func.cfg[fail_ni].terminator = Terminator::Unreachable;
+    }
+
+    debug!(func = %func.name, "stack canary eliminated");
+}
+
+// ── Array detection and rewriting ────────────────────────────────────────────
+
+/// Identify runs of contiguous same-type `Local` slots and mark the base slot
+/// with `ArrayInfo { count, stride }`.
+///
+/// Slots are sorted by ascending `rbp_offset` (most-negative first = lowest
+/// address = array index 0).  A run of N ≥ 2 consecutive slots at uniform
+/// `stride` (= element byte size) is promoted to an array.
+fn detect_arrays(func: &mut IrFunction) {
+    let mut offsets: Vec<i64> = func.slot_table
+        .iter()
+        .filter(|(_, s)| matches!(s.origin, SlotOrigin::Local) && s.ty != IrType::Unknown)
+        .map(|(off, _)| *off)
+        .collect();
+    offsets.sort();
+
+    let mut i = 0;
+    while i < offsets.len() {
+        let base_off = offsets[i];
+        let base_ty  = func.slot_table[&base_off].ty.clone();
+        let stride = match base_ty.byte_size() {
+            Some(s) if s > 0 => s as i64,
+            _ => { i += 1; continue; }
+        };
+
+        let mut count = 1usize;
+        while i + count < offsets.len() {
+            let expected = base_off + stride * count as i64;
+            let next_off = offsets[i + count];
+            if next_off == expected && func.slot_table[&next_off].ty == base_ty {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+
+        if count >= 2 {
+            let slot = func.slot_table.get_mut(&base_off).unwrap();
+            slot.array_info = Some(ArrayInfo { count: count as u32, stride: stride as u32 });
+            trace!(func   = %func.name,
+                   base   = base_off,
+                   count,
+                   stride,
+                   "stack array detected");
+        }
+
+        i += count;
+    }
+}
+
+/// Rewrite Load/Store statements whose pointer decomposes as
+/// `array_base_rbp_offset + index * stride` into `ArrayAccess` / `ArrayStore`
+/// IR nodes.
+///
+/// This runs after `detect_arrays` so `slot_table` already carries
+/// `ArrayInfo` on eligible base slots.
+fn rewrite_array_accesses(
+    func:    &mut IrFunction,
+    rbp_ids: &[u32],
+    def_map: &HashMap<u32, Expr>,
+) {
+    use petgraph::visit::NodeIndexable;
+    let node_count = func.cfg.node_count();
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        let stmts = std::mem::take(&mut func.cfg[idx].stmts);
+        let new_stmts: Vec<Stmt> = stmts.into_iter().map(|stmt| {
+            match stmt {
+                Stmt::Assign { lhs, ty, rhs: Expr::Load { ptr, ty: load_ty } } => {
+                    if let Some((name, index)) =
+                        try_resolve_array_ptr(&ptr, rbp_ids, def_map, func)
+                    {
+                        Stmt::Assign { lhs, ty, rhs: Expr::ArrayAccess { name, index, elem_ty: load_ty } }
+                    } else {
+                        Stmt::Assign { lhs, ty, rhs: Expr::Load { ptr, ty: load_ty } }
+                    }
+                }
+                Stmt::Store { ptr, val } => {
+                    if let Some((name, index)) =
+                        try_resolve_array_ptr(&ptr, rbp_ids, def_map, func)
+                    {
+                        Stmt::ArrayStore { name, index, val }
+                    } else {
+                        Stmt::Store { ptr, val }
+                    }
+                }
+                other => other,
+            }
+        }).collect();
+        func.cfg[idx].stmts = new_stmts;
+    }
+}
+
+/// Try to decompose `ptr` as `rbp_offset + index * stride`, returning
+/// `(array_name, index_value)` when the offset maps to an array base slot.
+fn try_resolve_array_ptr(
+    ptr:     &Value,
+    rbp_ids: &[u32],
+    def_map: &HashMap<u32, Expr>,
+    func:    &IrFunction,
+) -> Option<(String, Value)> {
+    let ptr_id = match ptr {
+        Value::Var { id, .. } => *id,
+        _ => return None,
+    };
+
+    let (rbp_off, index, stride) = decompose_indexed_ptr(ptr_id, rbp_ids, def_map)?;
+
+    let slot = func.slot_table.get(&rbp_off)?;
+    let info = slot.array_info.as_ref()?;
+    if info.stride as u64 != stride { return None; }
+
+    Some((slot.name.clone(), index))
+}
+
+/// Walk the def_map chain for `ptr_id` trying to decompose the expression as
+/// `const_rbp_offset + index * stride`.
+///
+/// Handles two patterns:
+/// - `Add(rbp_base, Mul(index, stride))` — base first, scaled index second
+/// - `Sub(Add(rbp_var, Mul(index, stride)), K)` — LEA-style with final subtraction
+fn decompose_indexed_ptr(
+    ptr_id:  u32,
+    rbp_ids: &[u32],
+    def_map: &HashMap<u32, Expr>,
+) -> Option<(i64, Value, u64)> {
+    match def_map.get(&ptr_id)? {
+        Expr::BinOp { op: BinOp::Add, lhs, rhs } => {
+            // Try lhs = rbp-relative base, rhs = scaled index.
+            if let Some(off) = resolve_offset(lhs, rbp_ids, def_map) {
+                if let Some((idx, s)) = try_extract_scaled(rhs, def_map) {
+                    return Some((off, idx, s));
+                }
+            }
+            // Try rhs = rbp-relative base, lhs = scaled index.
+            if let Some(off) = resolve_offset(rhs, rbp_ids, def_map) {
+                if let Some((idx, s)) = try_extract_scaled(lhs, def_map) {
+                    return Some((off, idx, s));
+                }
+            }
+            None
+        }
+        // LEA [rbp + idx*scale - K]: inner is Add, outer subtracts a constant.
+        Expr::BinOp { op: BinOp::Sub, lhs: Value::Var { id: inner_id, .. }, rhs: Value::Const { val: k, .. } } => {
+            let (off, idx, s) = decompose_indexed_ptr(*inner_id, rbp_ids, def_map)?;
+            Some((off - *k as i64, idx, s))
+        }
+        _ => None,
+    }
+}
+
+/// If `val` is a Var defined as `Mul(index, stride_const)` (or the
+/// commuted form), return `(index, stride_const)`.
+fn try_extract_scaled(val: &Value, def_map: &HashMap<u32, Expr>) -> Option<(Value, u64)> {
+    let id = match val {
+        Value::Var { id, .. } => *id,
+        _ => return None,
+    };
+    match def_map.get(&id)? {
+        Expr::BinOp { op: BinOp::Mul, lhs, rhs: Value::Const { val: s, .. } } if *s > 0 => {
+            Some((lhs.clone(), *s))
+        }
+        Expr::BinOp { op: BinOp::Mul, lhs: Value::Const { val: s, .. }, rhs } if *s > 0 => {
+            Some((rhs.clone(), *s))
+        }
+        _ => None,
+    }
 }
 
 // ── Legacy public helpers (kept for codegen compatibility) ────────────────────

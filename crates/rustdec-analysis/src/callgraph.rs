@@ -148,7 +148,7 @@ pub fn build_call_graph(module: &IrModule) -> CallGraph {
 
                     let callee: Option<String> = match target {
                         CallTarget::Named(name) => {
-                            Some(name.clone())
+                            Some(name.to_string())
                         }
                         CallTarget::Direct(addr) => {
                             addr_to_name.get(addr).map(|s| (*s).to_string())

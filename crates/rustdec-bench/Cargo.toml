@@ -1,0 +1,23 @@
+[package]
+name             = "rustdec-bench"
+description      = "Benchmark suite for the RustDec decompilation pipeline"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "rustdec-bench"
+path = "src/main.rs"
+
+[dependencies]
+rustdec-loader.workspace   = true
+rustdec-analysis.workspace = true
+rustdec-codegen.workspace  = true
+rustdec-ir.workspace       = true
+serde.workspace     = true
+serde_json.workspace = true
+anyhow.workspace    = true
+
+clap = { version = "4", features = ["derive"] }

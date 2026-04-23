@@ -1,8 +1,9 @@
 //! x86-64 instruction lifter with register mapping and flag tracking.
 
 use rustdec_disasm::Instruction;
-use rustdec_ir::{BinOp, CallTarget, Expr, IrType, Stmt, Value};
+use rustdec_ir::{BinOp, CallTarget, Expr, IrType, IrTypeRef, Stmt, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{trace, warn};
 
 // ── Register table ────────────────────────────────────────────────────────────
@@ -182,65 +183,67 @@ fn lift_insn(
     let mnem = strip_size_suffix(&raw);
     let ops  = insn.operands.trim();
 
-    // Intel syntax: "dst, src".
-    // We also handle AT&T `%`-prefixed operands — normalize_reg strips the `%`.
+    // Capstone emits AT&T syntax: "src, dst" (source first, destination second).
+    // We also handle `%`-prefixed operands — normalize_reg strips the `%`.
     let parts: Vec<&str> = ops.splitn(2, ',').map(str::trim).collect();
-    let dst = parts.first().copied().unwrap_or("");
-    let src = parts.get(1).copied().unwrap_or("");
+    let op0 = parts.first().copied().unwrap_or(""); // AT&T src (single-operand: the operand)
+    let op1 = parts.get(1).copied().unwrap_or("");  // AT&T dst (two-operand instructions)
 
     match mnem {
         // ── Data movement ────────────────────────────────────────────────────
-        "movsx" | "movsxd" => lift_movsx(dst, src, next_id, regs),
-        "mov" | "movabs" | "movzx" | "movz" | "movs" => lift_mov(dst, src, next_id, regs),
+        // Two-operand AT&T: src=op0, dst=op1 — swap relative to Intel convention.
+        "movsx" | "movsxd" => lift_movsx(op1, op0, next_id, regs),
+        "mov" | "movabs" | "movzx" | "movz" | "movs" => lift_mov(op1, op0, next_id, regs),
 
-        "lea"   => lift_lea(dst, src, next_id, regs, insn.address, insn.size),
-        "push"  => lift_push(dst, next_id, regs),
-        "pop"   => lift_pop(dst, next_id, regs),
+        "lea"   => lift_lea(op1, op0, next_id, regs, insn.address, insn.size),
+        "push"  => lift_push(op0, next_id, regs),
+        "pop"   => lift_pop(op0, next_id, regs),
         "leave" => lift_leave(next_id, regs),
 
         "xchg" => {
-            let va = operand_to_val(dst, regs);
-            let vb = operand_to_val(src, regs);
+            let va = operand_to_val(op0, regs);
+            let vb = operand_to_val(op1, regs);
             let ty = value_type(&va);
             let (tmp, tmp_val) = fresh(next_id, ty.clone());
             // tmp = va ; *va_ptr = vb ; *vb_ptr = tmp
             // (simplified — we don't emit true pointer semantics for xchg)
             vec![
-                Stmt::Assign { lhs: tmp, ty: ty.clone(), rhs: Expr::Value(va.clone()) },
+                Stmt::Assign { lhs: tmp, ty: (*ty).clone(), rhs: Expr::Value(va.clone()) },
                 Stmt::Store  { ptr: va, val: vb.clone() },
                 Stmt::Store  { ptr: vb, val: tmp_val },
             ]
         }
 
         // ── Arithmetic / logic ───────────────────────────────────────────────
+        // Two-operand AT&T: src=op0, dst=op1.
         "add" | "sub" | "and" | "or" | "xor"
         | "cmp" | "test"
         | "adc" | "sbb"
         | "shl" | "shr" | "sar"
-        | "imul" | "mul" => lift_binop(mnem, dst, src, next_id, regs, flags),
+        | "imul" | "mul" => lift_binop(mnem, op1, op0, next_id, regs, flags),
 
-        "div"  => lift_div(dst, next_id, regs, false),
-        "idiv" => lift_div(dst, next_id, regs, true),
+        "div"  => lift_div(op0, next_id, regs, false),
+        "idiv" => lift_div(op0, next_id, regs, true),
 
-        "inc" => lift_incdec(dst, BinOp::Add, next_id, regs),
-        "dec" => lift_incdec(dst, BinOp::Sub, next_id, regs),
+        "inc" => lift_incdec(op0, BinOp::Add, next_id, regs),
+        "dec" => lift_incdec(op0, BinOp::Sub, next_id, regs),
 
         "neg" => {
-            let lhs = operand_to_val(dst, regs);
+            let lhs = operand_to_val(op0, regs);
             let ty  = value_type(&lhs);
             let (id, _) = fresh(next_id, ty.clone());
-            regs.set(dst, id);
-            vec![Stmt::Assign { lhs: id, ty: ty.clone(),
+            regs.set(op0, id);
+            vec![Stmt::Assign { lhs: id, ty: (*ty).clone(),
                 rhs: Expr::BinOp { op: BinOp::Sub,
                     lhs: Value::Const { val: 0, ty }, rhs: lhs } }]
         }
 
         "not" => {
-            let lhs = operand_to_val(dst, regs);
+            let lhs = operand_to_val(op0, regs);
             let ty  = value_type(&lhs);
             let (id, _) = fresh(next_id, ty.clone());
-            regs.set(dst, id);
-            vec![Stmt::Assign { lhs: id, ty: ty.clone(),
+            regs.set(op0, id);
+            vec![Stmt::Assign { lhs: id, ty: (*ty).clone(),
                 rhs: Expr::BinOp { op: BinOp::Xor, lhs,
                     rhs: Value::Const { val: u64::MAX, ty } } }]
         }
@@ -310,7 +313,7 @@ fn lift_mov(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable) -
         (expr, ptr_stmts)
     } else {
         let src_val = operand_to_val(src, regs);
-        let expr = if value_type(&src_val) != dst_ty {
+        let expr = if *value_type(&src_val) != dst_ty {
             Expr::Cast { val: src_val, to: dst_ty.clone() }
         } else {
             Expr::Value(src_val)
@@ -330,7 +333,7 @@ fn lift_mov(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable) -
         regs.set(&to_64bit_name(dst), ext_id);
         stmts.push(Stmt::Assign {
             lhs: ext_id, ty: IrType::UInt(64),
-            rhs: Expr::Cast { val: Value::Var { id: new_id, ty: dst_ty }, to: IrType::UInt(64) },
+            rhs: Expr::Cast { val: Value::Var { id: new_id, ty: Arc::new(dst_ty) }, to: IrType::UInt(64) },
         });
     }
     stmts
@@ -345,7 +348,7 @@ fn lift_push(src: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt
     vec![
         Stmt::Assign { lhs: rsp_new, ty: IrType::UInt(64),
             rhs: Expr::BinOp { op: BinOp::Sub, lhs: rsp_old,
-                rhs: Value::Const { val: 8, ty: IrType::UInt(64) } } },
+                rhs: Value::Const { val: 8, ty: Arc::new(IrType::UInt(64)) } } },
         Stmt::Store { ptr: rsp_new_val, val },
     ]
 }
@@ -364,7 +367,7 @@ fn lift_pop(dst: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt>
             rhs: Expr::Load { ptr: rsp_ptr, ty: IrType::UInt(64) } },
         Stmt::Assign { lhs: rsp_new, ty: IrType::UInt(64),
             rhs: Expr::BinOp { op: BinOp::Add, lhs: rsp_old,
-                rhs: Value::Const { val: 8, ty: IrType::UInt(64) } } },
+                rhs: Value::Const { val: 8, ty: Arc::new(IrType::UInt(64)) } } },
     ]
 }
 
@@ -383,7 +386,7 @@ fn lift_syscall(next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
         lhs: ret_id,
         ty:  IrType::SInt(64),
         rhs: Expr::Call {
-            target: CallTarget::Named("__syscall".to_string()),
+            target: CallTarget::Named(Arc::from("__syscall")),
             args:   vec![nr, a0, a1, a2, a3, a4, a5],
             ret_ty: IrType::SInt(64),
         },
@@ -407,9 +410,9 @@ fn lift_incdec(dst: &str, op: BinOp, next_id: &mut u32, regs: &mut RegisterTable
     let ty  = value_type(&lhs);
     let (id, _) = fresh(next_id, ty.clone());
     regs.set(dst, id);
-    vec![Stmt::Assign { lhs: id, ty,
+    vec![Stmt::Assign { lhs: id, ty: (*ty).clone(),
         rhs: Expr::BinOp { op, lhs,
-            rhs: Value::Const { val: 1, ty: IrType::UInt(64) } } }]
+            rhs: Value::Const { val: 1, ty: Arc::new(IrType::UInt(64)) } } }]
 }
 
 // ── Memory address expression parser ─────────────────────────────────────────
@@ -424,7 +427,39 @@ struct MemExpr<'a> {
 
 impl<'a> MemExpr<'a> {
     fn parse(s: &'a str) -> Self {
+        let s = s.trim().trim_start_matches('*'); // strip AT&T indirect-call marker
         let s = strip_mem_prefix(s);
+
+        // AT&T form: optional_disp(%base, %index, scale) — e.g. "0xff9(%rip)", "-8(%rbp)"
+        if s.contains('(') && !s.contains('[') {
+            let mut expr = MemExpr { scale: 1, ..Default::default() };
+            if let Some(paren) = s.find('(') {
+                let disp_str = s[..paren].trim();
+                if !disp_str.is_empty() {
+                    expr.disp = parse_int_signed(disp_str);
+                }
+                let inner = s[paren + 1..].trim_end_matches(')');
+                let components: Vec<&str> = inner.split(',').map(str::trim).collect();
+                if let Some(base) = components.first() {
+                    let b = base.trim_start_matches('%');
+                    if !b.is_empty() && is_register(b) {
+                        expr.base = Some(b);
+                    }
+                }
+                if let Some(idx) = components.get(1) {
+                    let i = idx.trim_start_matches('%');
+                    if !i.is_empty() && is_register(i) {
+                        expr.index = Some(i);
+                    }
+                }
+                if let Some(sc) = components.get(2) {
+                    expr.scale = parse_int(sc).unwrap_or(1);
+                }
+            }
+            return expr;
+        }
+
+        // Intel form: [base + index*scale + disp]
         let inner = s.trim_start_matches('[').trim_end_matches(']').trim();
         let mut expr = MemExpr { scale: 1, ..Default::default() };
 
@@ -480,9 +515,9 @@ impl<'a> MemExpr<'a> {
                 let id = regs.get(r)
                     .or_else(|| { let r64 = to_64bit_name(r); regs.get(&r64) })
                     .unwrap_or_else(|| reg_name_to_placeholder_id(r));
-                Value::Var { id, ty: IrType::UInt(64) }
+                Value::Var { id, ty: Arc::new(IrType::UInt(64)) }
             }
-            None => Value::Const { val: 0, ty: IrType::UInt(64) },
+            None => Value::Const { val: 0, ty: Arc::new(IrType::UInt(64)) },
         };
 
         // index * scale
@@ -490,7 +525,7 @@ impl<'a> MemExpr<'a> {
             let idx_id = regs.get(idx)
                 .or_else(|| { let r64 = to_64bit_name(idx); regs.get(&r64) })
                 .unwrap_or_else(|| reg_name_to_placeholder_id(idx));
-            let idx_val = Value::Var { id: idx_id, ty: IrType::UInt(64) };
+            let idx_val = Value::Var { id: idx_id, ty: Arc::new(IrType::UInt(64)) };
 
             let scaled = if self.scale == 1 {
                 idx_val
@@ -498,7 +533,7 @@ impl<'a> MemExpr<'a> {
                 let (s_id, s_val) = fresh(next_id, IrType::UInt(64));
                 stmts.push(Stmt::Assign { lhs: s_id, ty: IrType::UInt(64),
                     rhs: Expr::BinOp { op: BinOp::Mul, lhs: idx_val,
-                        rhs: Value::Const { val: self.scale, ty: IrType::UInt(64) } } });
+                        rhs: Value::Const { val: self.scale, ty: Arc::new(IrType::UInt(64)) } } });
                 s_val
             };
             let (a_id, a_val) = fresh(next_id, IrType::UInt(64));
@@ -518,7 +553,7 @@ impl<'a> MemExpr<'a> {
                 let (a_id, a_val) = fresh(next_id, IrType::UInt(64));
                 stmts.push(Stmt::Assign { lhs: a_id, ty: IrType::UInt(64),
                     rhs: Expr::BinOp { op, lhs: acc,
-                        rhs: Value::Const { val: abs, ty: IrType::UInt(64) } } });
+                        rhs: Value::Const { val: abs, ty: Arc::new(IrType::UInt(64)) } } });
                 acc = a_val;
             }
         }
@@ -543,7 +578,7 @@ fn lift_lea(
     if expr.base == Some("rip") {
         let rip = insn_address + insn_size as u64;
         let effective = rip.wrapping_add(expr.disp.unwrap_or(0) as u64);
-        let addr_val  = Value::Const { val: effective, ty: IrType::UInt(64) };
+        let addr_val  = Value::Const { val: effective, ty: Arc::new(IrType::UInt(64)) };
         let (dst_id, _) = fresh(next_id, IrType::UInt(64));
         regs.set(dst, dst_id);
         return vec![Stmt::Assign { lhs: dst_id, ty: IrType::UInt(64),
@@ -570,7 +605,7 @@ fn lift_binop(
     // Determine the BinOp and whether the result type should be signed.
     // `imul` and `sar` produce signed results — stamp SInt so downstream
     // comparisons and codegen can distinguish signed from unsigned arithmetic.
-    let (op, result_ty) = match mnem {
+    let (op, result_ty): (BinOp, IrTypeRef) = match mnem {
         "add" | "adc"          => (BinOp::Add,  ty.clone()),
         "sub" | "sbb" | "cmp"  => (BinOp::Sub,  ty.clone()),
         "and" | "test"         => (BinOp::And,  ty.clone()),
@@ -578,8 +613,8 @@ fn lift_binop(
         "xor"                  => (BinOp::Xor,  ty.clone()),
         "shl"                  => (BinOp::Shl,  ty.clone()),
         "shr"                  => (BinOp::LShr, ty.clone()),
-        "sar"                  => (BinOp::AShr, to_signed(&ty)), // signed result
-        "imul"                 => (BinOp::Mul,  to_signed(&ty)), // signed result
+        "sar"                  => (BinOp::AShr, Arc::new(to_signed(&ty))), // signed result
+        "imul"                 => (BinOp::Mul,  Arc::new(to_signed(&ty))), // signed result
         "mul"                  => (BinOp::Mul,  ty.clone()),
         _                      => (BinOp::Add,  ty.clone()),
     };
@@ -591,14 +626,14 @@ fn lift_binop(
                 let id = alloc(next_id, IrType::UInt(64));
                 regs.set(dst, id);
                 return vec![Stmt::Assign { lhs: id, ty: IrType::UInt(64),
-                    rhs: Expr::Value(Value::Const { val: 0, ty: IrType::UInt(64) }) }];
+                    rhs: Expr::Value(Value::Const { val: 0, ty: Arc::new(IrType::UInt(64)) }) }];
             }
         }
     }
 
     // Core computation.
     let (res_id, _) = fresh(next_id, result_ty.clone());
-    stmts.push(Stmt::Assign { lhs: res_id, ty: result_ty.clone(),
+    stmts.push(Stmt::Assign { lhs: res_id, ty: (*result_ty).clone(),
         rhs: Expr::BinOp { op, lhs: lhs_val, rhs: rhs_val } });
 
     // Write-back (cmp / test are flag-only — no destination update).
@@ -644,7 +679,7 @@ fn lift_movsx(dst: &str, src: &str, next_id: &mut u32, regs: &mut RegisterTable)
         regs.set(&to_64bit_name(dst), ext_id);
         stmts.push(Stmt::Assign {
             lhs: ext_id, ty: IrType::SInt(64),
-            rhs: Expr::Cast { val: Value::Var { id: new_id, ty: dst_ty }, to: IrType::SInt(64) },
+            rhs: Expr::Cast { val: Value::Var { id: new_id, ty: Arc::new(dst_ty) }, to: IrType::SInt(64) },
         });
     }
     stmts
@@ -698,7 +733,7 @@ fn lift_call(ops: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt
         if is_register(reg_clean) {
             CallTarget::Indirect(reg_val(reg_clean, regs))
         } else {
-            CallTarget::Named(ops_clean.to_string())
+            CallTarget::Named(Arc::from(ops_clean))
         }
     };
 
@@ -719,25 +754,26 @@ fn lift_call(ops: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt
 /// - Register               → `Var` with the current SSA id from the table
 fn operand_to_val(op: &str, regs: &RegisterTable) -> Value {
     let op = op.trim().trim_start_matches('*'); // strip AT&T indirect marker
+    let op = op.trim_start_matches('$');        // strip AT&T immediate prefix
     let op = op.trim();
 
     if let Some(addr) = parse_hex(op) {
-        return Value::Const { val: addr, ty: IrType::UInt(64) };
+        return Value::Const { val: addr, ty: Arc::new(IrType::UInt(64)) };
     }
     if let Ok(v) = op.parse::<u64>() {
-        return Value::Const { val: v, ty: IrType::UInt(64) };
+        return Value::Const { val: v, ty: Arc::new(IrType::UInt(64)) };
     }
     if is_mem(op) {
         // Caller should use operand_ptr_full for a proper load; this path is
         // a fallback for callers that can't emit extra stmts.
-        return Value::Var { id: 9999, ty: infer_mem_type(op) };
+        return Value::Var { id: 9999, ty: Arc::new(infer_mem_type(op)) };
     }
 
     // Register — strip AT&T `%` prefix before lookup.
     let reg = op.trim_start_matches('%');
     let id  = regs.get(reg)
         .unwrap_or_else(|| reg_name_to_placeholder_id(reg));
-    Value::Var { id, ty: reg_type(reg) }
+    Value::Var { id, ty: Arc::new(reg_type(reg)) }
 }
 
 /// Emit stmts for a memory operand's address and return `(stmts, ptr_val)`.
@@ -757,7 +793,7 @@ fn operand_ptr(op: &str, regs: &RegisterTable) -> Value {
         .trim_start_matches('[').trim_end_matches(']').trim();
 
     if let Some(addr) = parse_hex(inner) {
-        return Value::Const { val: addr, ty: IrType::ptr(IrType::UInt(64)) };
+        return Value::Const { val: addr, ty: Arc::new(IrType::ptr(IrType::UInt(64))) };
     }
 
     let base_raw = inner
@@ -766,7 +802,7 @@ fn operand_ptr(op: &str, regs: &RegisterTable) -> Value {
     let base = base_raw.trim_start_matches('%');
     let id = regs.get(base)
         .unwrap_or_else(|| reg_name_to_placeholder_id(base));
-    Value::Var { id, ty: IrType::ptr(IrType::UInt(64)) }
+    Value::Var { id, ty: Arc::new(IrType::ptr(IrType::UInt(64))) }
 }
 
 fn reg_val(reg: &str, regs: &RegisterTable) -> Value {
@@ -776,7 +812,7 @@ fn reg_val(reg: &str, regs: &RegisterTable) -> Value {
     let id = regs.get(reg)
         .or_else(|| { let r64 = to_64bit_name(reg); regs.get(&r64) })
         .unwrap_or_else(|| reg_name_to_placeholder_id(reg));
-    Value::Var { id, ty: reg_type(reg) }
+    Value::Var { id, ty: Arc::new(reg_type(reg)) }
 }
 
 /// Map a register name to a stable placeholder SSA id for untracked registers.
@@ -810,9 +846,9 @@ fn reg_name_to_placeholder_id(reg: &str) -> u32 {
     }
 }
 
-fn fresh(next_id: &mut u32, ty: IrType) -> (u32, Value) {
+fn fresh(next_id: &mut u32, ty: impl Into<IrTypeRef>) -> (u32, Value) {
     let id = *next_id; *next_id += 1;
-    (id, Value::Var { id, ty })
+    (id, Value::Var { id, ty: ty.into() })
 }
 
 fn alloc(next_id: &mut u32, _ty: IrType) -> u32 {
@@ -852,7 +888,9 @@ fn infer_mem_type(op: &str) -> IrType {
     else                          { IrType::UInt(64) }
 }
 
-fn value_type(v: &Value) -> IrType { v.ty().clone() }
+fn value_type(v: &Value) -> IrTypeRef {
+    match v { Value::Var { ty, .. } | Value::Const { ty, .. } => Arc::clone(ty) }
+}
 
 fn is_mem(op: &str) -> bool {
     // Strip `*` prefix before checking — AT&T uses `*(%rax)` for indirect.

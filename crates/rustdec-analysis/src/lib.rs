@@ -8,12 +8,14 @@ pub mod cfg;
 pub mod dominance;
 pub mod functions;
 pub mod structure;
+pub mod string_recovery;
 
 pub use callgraph::{build_call_graph, CallGraph};
 pub use cfg::build_cfg;
 pub use dominance::{DomTree, NaturalLoop, find_natural_loops, find_convergence};
 pub use functions::detect_functions;
 pub use structure::{structure_function, StructuredFunc, SNode, CondExpr};
+pub use string_recovery::{RecoveredString, StringEncoding, apply_rodata_strings, recover_strings_from_binary, recover_strings_with_cfg};
 
 use rustdec_ir::IrModule;
 use rustdec_loader::{BinaryObject, build_symbol_map, extract_strings};
@@ -158,7 +160,25 @@ pub fn analyse(obj: &BinaryObject) -> AnalysisResult<IrModule> {
 
     let mut module = IrModule::default();
     module.functions = functions;
+    
+    // Use enhanced string recovery with DWARF if available
+    let string_table = if let Some(ref dwarf) = obj.dwarf {
+        debug!("Using DWARF-enhanced string recovery");
+        string_recovery::recover_strings_with_dwarf(obj, dwarf)
+            .into_iter()
+            .map(|s| (s.address, s.content))
+            .collect()
+    } else {
+        string_table
+    };
+    
     module.string_table = string_table;
+
+    // ── 5. Rewrite rodata string expressions ─────────────────────────────────
+    let replaced: usize = module.functions.iter_mut()
+        .map(|f| string_recovery::apply_rodata_strings(f, &module.string_table))
+        .sum();
+    info!(replaced_string_exprs = replaced, "rodata string expressions rewritten");
 
     let elapsed = t0.elapsed();
     info!(

@@ -21,6 +21,7 @@ use petgraph::graph::NodeIndex;
 use rustdec_disasm::Instruction;
 use rustdec_ir::{BasicBlock, BlockId, CfgEdge, IrFunction, Terminator, Value, IrType};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
 /// Build an [`IrFunction`] CFG.
@@ -156,11 +157,12 @@ pub fn build_cfg(
 
         // Map the last instruction to an IR Terminator and close the block.
         if insn.is_terminator() {
-            // ret / hlt / ud2 — function exit
-            let is_ret = matches!(insn.mnemonic.as_str(),
-                "ret" | "retf" | "retn" | "hlt" | "ud2" | "int3");
-            // jmp — unconditional transfer
-            let is_jmp = matches!(insn.mnemonic.as_str(), "jmp" | "ljmp");
+            // jmp — unconditional transfer (bare and AT&T-suffixed variants)
+            let is_jmp = matches!(insn.mnemonic.as_str(),
+                "jmp" | "jmpq" | "jmpl" | "ljmp");
+            // Everything else that is_terminator() accepts is a function exit
+            // (ret / retq / hlt / ud2 / int3).
+            let is_ret = !is_jmp;
 
             bb.terminator = if is_ret {
                 trace!(func = %name, at = format_args!("{:#x}", insn.address), "ret");
@@ -199,7 +201,7 @@ pub fn build_cfg(
                    "conditional branch");
             let from = bb.start_addr;
             bb.terminator = Terminator::Branch {
-                cond:     Value::Const { val: 0, ty: IrType::UInt(8) }, // placeholder
+                cond:     Value::Const { val: 0, ty: Arc::new(IrType::UInt(8)) }, // placeholder
                 _true_bb:  0,
                 _false_bb: 0,
                 // Preserve the exact branch mnemonic so codegen can emit the

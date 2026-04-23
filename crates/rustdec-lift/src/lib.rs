@@ -6,11 +6,12 @@
 pub mod frame;
 pub mod x86;
 
-use petgraph::visit::NodeIndexable;
+use petgraph::visit::{NodeIndexable, IntoNodeIdentifiers};
 use rustdec_disasm::Instruction;
 use rustdec_ir::{BinOp, Expr, IrFunction, IrType, SymbolKind, Stmt, Terminator, Value};
 use rustdec_loader::{SymbolMap, SymbolMapKind};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, instrument, trace};
 
 /// Lift all basic blocks of `func` in-place, then analyse the stack frame.
@@ -62,7 +63,7 @@ pub fn lift_function(
                        block   = format_args!("{:#x}", start_addr),
                        rax_id  = id,
                        "patching Return with rax value");
-                Terminator::Return(Some(Value::Var { id, ty: IrType::UInt(64) }))
+                Terminator::Return(Some(Value::Var { id, ty: Arc::new(IrType::UInt(64)) }))
             } else {
                 Terminator::Return(None)
             };
@@ -81,6 +82,18 @@ pub fn lift_function(
 
     // Frame analysis — runs last so it sees fully annotated stmts.
     frame::analyse_frame(func);
+
+    // Eliminate trivial slot spill/reload pairs produced by -O0 arg spills.
+    copy_propagate_slots(func);
+
+    // Second DCE round: remove assignments made dead by copy-propagation.
+    eliminate_dead_assigns(func);
+
+    // Remove -fstack-protector canary epilogue (call to __stack_chk_fail).
+    frame::eliminate_canary(func);
+
+    // Third DCE round: remove comparison chain made dead by canary removal.
+    eliminate_dead_assigns(func);
 
     // ABI arity inference — determines func.params from register usage.
     infer_abi_args(func);
@@ -118,6 +131,28 @@ fn resolve_constants(func: &mut IrFunction, symbols: &SymbolMap) {
     if symbols.is_empty() { return; }
 
     let const_eval = build_const_eval(func);
+
+    // Pre-build a map: lhs_id → inner_id for every Cast(Var(inner)) assignment.
+    // Used to resolve zero-extend chains (edi → rdi) when const_eval alone
+    // cannot follow the Cast because of block ordering.
+    let cast_map: HashMap<u32, u32> = {
+        let mut m = HashMap::new();
+        let n = func.cfg.node_count();
+        for ni in 0..n {
+            let idx = func.cfg.from_index(ni);
+            for stmt in &func.cfg[idx].stmts {
+                if let Stmt::Assign {
+                    lhs,
+                    rhs: Expr::Cast { val: Value::Var { id: inner, .. }, .. },
+                    ..
+                } = stmt {
+                    m.insert(*lhs, *inner);
+                }
+            }
+        }
+        m
+    };
+
     let node_count = func.cfg.node_count();
 
     for ni in 0..node_count {
@@ -156,25 +191,50 @@ fn resolve_constants(func: &mut IrFunction, symbols: &SymbolMap) {
                             }
                         }
                     }
-                    // ── Call site: resolve Var args that trace to a symbol ─────
+                    // ── Call site ─────────────────────────────────────────────
                     //
-                    // `Value` cannot carry an `Expr::Symbol` so for string args
-                    // we replace with `Const(addr)` — the codegen checks the
-                    // string_table for every `Const` call arg.
-                    Expr::Call { args, .. } => {
+                    // 1. Resolve Direct(addr) target to Named(name) when the
+                    //    address maps to a known function symbol (PLT stub, etc.)
+                    // 2. Resolve Var args that trace to a string address.
+                    Expr::Call { target, args, .. } => {
+                        // Resolve call target address → symbol name.
+                        if let rustdec_ir::CallTarget::Direct(addr) = target {
+                            if let Some(entry) = symbols.get(addr) {
+                                if entry.kind == SymbolMapKind::Function {
+                                    trace!(addr = format_args!("{:#x}", addr),
+                                           name = %entry.name,
+                                           "resolve_constants: Direct → Named");
+                                    *target = rustdec_ir::CallTarget::Named(Arc::clone(&entry.name));
+                                }
+                            }
+                        }
+                        // Resolve args (Var or Const) tracing to symbol addresses.
                         for arg in args.iter_mut() {
-                            if let Value::Var { id, .. } = arg {
-                                if let Some(&addr) = const_eval.get(id) {
-                                    if let Some(entry) = symbols.get(&addr) {
-                                        if entry.kind == SymbolMapKind::String {
-                                            trace!(id,
-                                                   addr = format_args!("{:#x}", addr),
-                                                   "resolve_constants: call arg → Const(addr)");
-                                            *arg = Value::Const {
-                                                val: addr,
-                                                ty:  IrType::Ptr(Box::new(IrType::UInt(8))),
-                                            };
-                                        }
+                            let resolved_addr = match arg {
+                                Value::Const { val, .. } => Some(*val),
+                                Value::Var   { id,  .. } => {
+                                    // Direct lookup first.
+                                    let direct = const_eval.get(id).copied();
+                                    if direct.is_some() {
+                                        direct
+                                    } else {
+                                        // The arg may be a zero-extended 64-bit
+                                        // version of a 32-bit register (edi → rdi).
+                                        // Look up one level of Cast via the pre-built map.
+                                        cast_map.get(id)
+                                            .and_then(|inner| const_eval.get(inner).copied())
+                                    }
+                                }
+                            };
+                            if let Some(addr) = resolved_addr {
+                                if let Some(entry) = symbols.get(&addr) {
+                                    if entry.kind == SymbolMapKind::String {
+                                        trace!(addr = format_args!("{:#x}", addr),
+                                               "resolve_constants: call arg → Const(addr)");
+                                        *arg = Value::Const {
+                                            val: addr,
+                                            ty:  Arc::new(IrType::Ptr(Box::new(IrType::UInt(8)))),
+                                        };
                                     }
                                 }
                             }
@@ -194,7 +254,7 @@ fn symbol_expr(addr: u64, entry: &rustdec_loader::SymbolEntry) -> Expr {
         SymbolMapKind::Function => SymbolKind::Function,
         SymbolMapKind::Global   => SymbolKind::Global,
     };
-    Expr::Symbol { addr, kind, name: entry.name.clone() }
+    Expr::Symbol { addr, kind, name: Arc::clone(&entry.name) }
 }
 
 // ── Constant folding helpers ──────────────────────────────────────────────────
@@ -208,13 +268,19 @@ fn symbol_expr(addr: u64, entry: &rustdec_loader::SymbolEntry) -> Expr {
 /// converges in 1–2 iterations.
 fn build_const_eval(func: &IrFunction) -> HashMap<u32, u64> {
     let mut eval: HashMap<u32, u64> = HashMap::new();
-    let node_count = func.cfg.node_count();
 
-    for _ in 0..16 {
+    // Use address-sorted block order (= entry-first topological approximation)
+    // so that a `mov rdi, addr` in block A propagates to a `call` in block B
+    // even when A and B are different basic blocks.
+    // We iterate up to 4 times to handle the rare case where blocks are not
+    // in strict dominator order (loops, back-edges).
+    let blocks = func.blocks_sorted();
+    // Up to 8 passes to handle multi-hop chains:
+    // Const(0x401180) → new_id [Cast UInt32] → ext_id [Cast UInt64] → call arg
+    for _ in 0..8 {
         let mut changed = false;
-        for ni in 0..node_count {
-            let idx = func.cfg.from_index(ni);
-            for stmt in &func.cfg[idx].stmts {
+        for bb in &blocks {
+            for stmt in &bb.stmts {
                 if let Stmt::Assign { lhs, rhs, .. } = stmt {
                     if eval.contains_key(lhs) { continue; }
                     if let Some(v) = try_eval_expr(rhs, &eval) {
@@ -329,6 +395,10 @@ fn collect_reads_stmt(stmt: &Stmt, live: &mut HashSet<u32>) {
             collect_reads_value(ptr, live);
             collect_reads_value(val, live);
         }
+        Stmt::ArrayStore { index, val, .. } => {
+            collect_reads_value(index, live);
+            collect_reads_value(val, live);
+        }
         Stmt::Nop => {}
     }
 }
@@ -345,6 +415,7 @@ fn collect_reads_expr(expr: &Expr, live: &mut HashSet<u32>) {
         Expr::Call { args, .. }            => {
             for a in args { collect_reads_value(a, live); }
         }
+        Expr::ArrayAccess { index, .. }    => collect_reads_value(index, live),
         Expr::Symbol { .. }                => {}
         Expr::Opaque(_)                    => {}
     }
@@ -416,14 +487,36 @@ fn infer_abi_args(func: &mut IrFunction) {
         collect_reads_terminator(&func.cfg[idx].terminator, &mut live);
     }
 
+    // Collect all SSA ids that are *written* (assigned) in the function body.
+    // A seed id that only appears as a call arg but is never written was never
+    // intentionally set by the caller for this specific function — it is an
+    // ABI phantom, not a real argument.
+    let mut written: HashSet<u32> = HashSet::new();
+    for ni in 0..n {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            if let Stmt::Assign { lhs, .. } = stmt {
+                written.insert(*lhs);
+            }
+        }
+    }
+
     // Determine the arity and infer types for each arg register in ABI order.
+    // A register is a real argument if its seed id is:
+    //   a) read somewhere in the function (live), AND
+    //   b) NOT written before its first read (i.e. the seed value flows through).
+    // We stop at the first register that fails this test to preserve ABI order.
     let mut params: Vec<IrType> = Vec::new();
     for &reg in ARG_ORDER {
         let seed = match reg_to_seed.get(reg) {
             Some(&id) => id,
             None      => break,
         };
-        if !live.contains(&seed) { break; } // first unread reg → stop
+        // Seed not read at all → not an argument.
+        if !live.contains(&seed) { break; }
+        // Seed id is in written → the function assigns this reg before using
+        // the incoming value → not an argument register for this function.
+        if written.contains(&seed) { break; }
         params.push(infer_seed_type(func, seed));
     }
 
@@ -455,4 +548,157 @@ fn infer_seed_type(func: &IrFunction, seed: u32) -> IrType {
         }
     }
     IrType::UInt(64)
+}
+
+// ── Slot copy-propagation ─────────────────────────────────────────────────────
+
+/// Eliminate trivial stack-slot spill/reload pairs produced by -O0 compilation.
+///
+/// A slot written exactly once (`Store(slot, v)`) and read exactly once
+/// (`x = Load(slot)`) is a trivial copy.  After this pass:
+/// - The spill store is replaced by `Nop`.
+/// - Every use of the reload result `x` is replaced by `v` directly.
+/// - The now-dead `x = v` assignment is removed by the subsequent DCE round.
+///
+/// The substitution map is normalised (chains flattened) so that
+/// `a → b → c` becomes `a → c`, covering the rare case where a spilled
+/// value was itself loaded from another eligible slot.
+fn copy_propagate_slots(func: &mut IrFunction) {
+    use frame::is_slot_id;
+
+    let node_count = func.cfg.node_count();
+
+    // ── Phase 1: count stores and loads per slot pointer id ──────────────────
+    let mut store_count: HashMap<u32, u32>   = HashMap::new();
+    let mut store_vals:  HashMap<u32, Value> = HashMap::new();
+    let mut load_count:  HashMap<u32, u32>   = HashMap::new();
+
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            match stmt {
+                Stmt::Store { ptr: Value::Var { id, .. }, val }
+                    if is_slot_id(*id) =>
+                {
+                    *store_count.entry(*id).or_insert(0) += 1;
+                    store_vals.entry(*id).or_insert_with(|| val.clone());
+                }
+                Stmt::Assign {
+                    rhs: Expr::Load { ptr: Value::Var { id, .. }, .. }, ..
+                } if is_slot_id(*id) => {
+                    *load_count.entry(*id).or_insert(0) += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Eligible: written exactly once AND read exactly once.
+    let eligible: HashSet<u32> = store_count
+        .iter()
+        .filter(|(&id, &sc)| sc == 1 && load_count.get(&id).copied().unwrap_or(0) == 1)
+        .map(|(&id, _)| id)
+        .collect();
+
+    if eligible.is_empty() { return; }
+
+    // ── Phase 2: build substitution map: reload_lhs → stored value ───────────
+    let mut sub_map: HashMap<u32, Value> = HashMap::new();
+
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        for stmt in &func.cfg[idx].stmts {
+            if let Stmt::Assign {
+                lhs,
+                rhs: Expr::Load { ptr: Value::Var { id, .. }, .. },
+                ..
+            } = stmt {
+                if eligible.contains(id) {
+                    sub_map.insert(*lhs, store_vals[id].clone());
+                }
+            }
+        }
+    }
+
+    // Normalise: flatten chains (a→b→c becomes a→c) so a single substitution
+    // pass handles transitive copies without a second round.
+    for _ in 0..16 {
+        let mut changed = false;
+        let keys: Vec<u32> = sub_map.keys().copied().collect();
+        for k in keys {
+            let deeper = match sub_map.get(&k) {
+                Some(Value::Var { id, .. }) => sub_map.get(id).cloned(),
+                _ => None,
+            };
+            if let Some(v) = deeper {
+                sub_map.insert(k, v);
+                changed = true;
+            }
+        }
+        if !changed { break; }
+    }
+
+    // ── Phase 3: rewrite — nop spills, fold reloads, substitute all uses ─────
+    for ni in 0..node_count {
+        let idx = func.cfg.from_index(ni);
+        let mut stmts = std::mem::take(&mut func.cfg[idx].stmts);
+        for stmt in &mut stmts {
+            match stmt {
+                Stmt::Store { ptr: Value::Var { id, .. }, .. } if eligible.contains(id) => {
+                    *stmt = Stmt::Nop;
+                }
+                Stmt::Assign { rhs, .. } => {
+                    // Reload from eligible slot → replace with the stored value.
+                    let replacement = if let Expr::Load { ptr: Value::Var { id, .. }, .. } = &*rhs {
+                        eligible.contains(id).then(|| store_vals[id].clone())
+                    } else {
+                        None
+                    };
+                    if let Some(val) = replacement {
+                        *rhs = Expr::Value(val);
+                    }
+                    // Substitute propagated variables (handles chaining and other uses).
+                    subst_expr(rhs, &sub_map);
+                }
+                Stmt::Store { ptr, val } => {
+                    subst_value(ptr, &sub_map);
+                    subst_value(val, &sub_map);
+                }
+                Stmt::ArrayStore { index, val, .. } => {
+                    subst_value(index, &sub_map);
+                    subst_value(val, &sub_map);
+                }
+                Stmt::Nop => {}
+            }
+        }
+        func.cfg[idx].stmts = stmts;
+
+        match &mut func.cfg[idx].terminator {
+            Terminator::Return(Some(v))     => subst_value(v, &sub_map),
+            Terminator::Branch { cond, .. } => subst_value(cond, &sub_map),
+            _ => {}
+        }
+    }
+
+    trace!(func       = %func.name,
+           propagated = sub_map.len(),
+           "slot copy-propagation complete");
+}
+
+fn subst_value(v: &mut Value, map: &HashMap<u32, Value>) {
+    if let Value::Var { id, .. } = v {
+        if let Some(r) = map.get(id) { *v = r.clone(); }
+    }
+}
+
+fn subst_expr(expr: &mut Expr, map: &HashMap<u32, Value>) {
+    match expr {
+        Expr::Value(v)               => subst_value(v, map),
+        Expr::BinOp { lhs, rhs, .. } => { subst_value(lhs, map); subst_value(rhs, map); }
+        Expr::Load  { ptr, .. }      => subst_value(ptr, map),
+        Expr::Cast  { val, .. }      => subst_value(val, map),
+        Expr::Call  { args, .. }     => args.iter_mut().for_each(|a| subst_value(a, map)),
+        Expr::ArrayAccess { index, .. } => subst_value(index, map),
+        Expr::Symbol { .. } | Expr::Opaque(_) => {}
+    }
 }

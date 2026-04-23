@@ -1,13 +1,13 @@
 [package]
 name        = "rustdec-gui"
-description = "GTK4 graphical interface for RustDec"
+description = "GTK4 graphical interface for Corpo Fractum"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
 rust-version.workspace = true
 
 [[bin]]
-name = "rustdec"
+name = "corpo-fractum"
 path = "src/main.rs"
 
 [features]

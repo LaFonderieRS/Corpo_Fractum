@@ -93,6 +93,9 @@ impl RustBackend {
             Stmt::Store { ptr, val } => {
                 format!("*{} = {}", ptr.display(), val.display())
             }
+            Stmt::ArrayStore { name, index, val } => {
+                format!("{name}[{}] = {}", index.display(), val.display())
+            }
             Stmt::Nop => "// nop".into(),
         }
     }
@@ -130,6 +133,9 @@ impl RustBackend {
                 SymbolKind::Function => sanitise_rust(name),
                 SymbolKind::Global   => sanitise_rust(name),
             },
+            Expr::ArrayAccess { name, index, .. } => {
+                format!("{name}[{}]", index.display())
+            }
         }
     }
 
