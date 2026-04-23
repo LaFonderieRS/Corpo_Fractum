@@ -6,13 +6,13 @@ Command-line front-end for [Corpo Fractum](../README.md) — decompiles x86-64 E
 
 ```sh
 # from the workspace root
-cargo install --path rustdec-cli
+cargo install --path corpo-fractum-cli
 ```
 
 Or build without installing:
 
 ```sh
-cargo build --release -p rustdec-cli
+cargo build --bin corpo-fractum-cli
 # binary at: target/release/corpo-fractum-cli
 ```
 
@@ -24,15 +24,15 @@ corpo-fractum-cli [OPTIONS] <BINARY>
 
 ### Options
 
-| Flag | Description |
-|---|---|
-| `-l, --lang <LANG>` | Output language: `c` (default), `cpp`, `rust` |
-| `-o, --output <DIR>` | Write one `<function>.<ext>` file per function into DIR |
-| `-F, --function <NAME>` | Decompile only this function (repeatable) |
-| `--list` | List detected functions and exit — fast, no full analysis |
-| `--emit-ir` | Dump the lifted IR instead of decompiled source (debug) |
-| `-v / -vv / -vvv` | Log verbosity: info / debug / trace |
-| `RUSTDEC_LOG=<filter>` | Override verbosity via env variable (takes precedence over `-v`) |
+|           Flag          |                            Description                           |
+|-------------------------|------------------------------------------------------------------|
+| `-l, --lang <LANG>`     | Output language: `c` (default), `cpp`, `rust`                    |
+| `-o, --output <DIR>`    | Write one `<function>.<ext>` file per function into DIR          |
+| `-F, --function <NAME>` | Decompile only this function (repeatable)                        |
+| `--list`                | List detected functions and exit — fast, no full analysis        |
+| `--emit-ir`             | Dump the lifted IR instead of decompiled source (debug)          |
+| `-v / -vv / -vvv`       | Log verbosity: info / debug / trace                              |
+| `RUSTDEC_LOG=<filter>`  | Override verbosity via env variable (takes precedence over `-v`) |
 
 ### Examples
 
@@ -63,9 +63,9 @@ RUSTDEC_LOG=debug corpo-fractum-cli ./target_binary
 
 ## Exit codes
 
-| Code | Meaning |
-|---|---|
-| 0 | Success |
-| 1 | Any error (load failure, unsupported arch, codegen error) |
+| Code |                         Meaning                           |
+|------|-----------------------------------------------------------|
+| 0    | Success                                                   |
+| 1    | Any error (load failure, unsupported arch, codegen error) |
 
 Error messages are written to stderr; decompiled source goes to stdout (or to files when `-o` is used).
