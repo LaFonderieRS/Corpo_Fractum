@@ -386,7 +386,7 @@ fn lift_syscall(next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt> {
         lhs: ret_id,
         ty:  IrType::SInt(64),
         rhs: Expr::Call {
-            target: CallTarget::Named("__syscall".to_string()),
+            target: CallTarget::Named(Arc::from("__syscall")),
             args:   vec![nr, a0, a1, a2, a3, a4, a5],
             ret_ty: IrType::SInt(64),
         },
@@ -733,7 +733,7 @@ fn lift_call(ops: &str, next_id: &mut u32, regs: &mut RegisterTable) -> Vec<Stmt
         if is_register(reg_clean) {
             CallTarget::Indirect(reg_val(reg_clean, regs))
         } else {
-            CallTarget::Named(ops_clean.to_string())
+            CallTarget::Named(Arc::from(ops_clean))
         }
     };
 

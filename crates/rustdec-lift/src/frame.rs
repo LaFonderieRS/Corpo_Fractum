@@ -684,7 +684,7 @@ pub fn eliminate_canary(func: &mut IrFunction) {
             if let Stmt::Assign {
                 rhs: Expr::Call { target: CallTarget::Named(name), .. }, ..
             } = stmt {
-                if name == "__stack_chk_fail" {
+                if &**name == "__stack_chk_fail" {
                     fail_nodes.insert(idx);
                     break;
                 }

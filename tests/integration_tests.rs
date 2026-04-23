@@ -242,7 +242,7 @@ fn rodata_string_recovery_via_movabs_and_lea() {
             bb.stmts.iter().any(|s| matches!(s,
                 rustdec_ir::Stmt::Assign {
                     rhs: Expr::Symbol { kind: SymbolKind::String, name, .. }, ..
-                } if name == "hello world"
+                } if &**name == "hello world"
             ))
         });
         assert!(found,

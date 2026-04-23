@@ -351,7 +351,7 @@ fn extract_call_graph(module: &IrModule) -> CallGraphData {
             for stmt in &block.stmts {
                 let callee_name = match stmt {
                     Stmt::Assign { rhs: Expr::Call { target, .. }, .. } => match target {
-                        CallTarget::Named(n)   => Some(n.clone()),
+                        CallTarget::Named(n)   => Some(n.to_string()),
                         CallTarget::Direct(a)  => addr_to_idx
                             .get(a)
                             .map(|&i| functions[i].name.clone()),

@@ -9,6 +9,7 @@
 use rustdec_ir::{Expr, IrFunction, Stmt, SymbolKind, Value};
 use rustdec_loader::{BinaryObject, Section, SectionKind, DwarfInfo};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, warn, trace};
 
 /// Configuration for string recovery
@@ -487,7 +488,7 @@ pub fn apply_rodata_strings(func: &mut IrFunction, string_table: &HashMap<u64, S
                     string_table.get(val).map(|text| Expr::Symbol {
                         addr: *val,
                         kind: SymbolKind::String,
-                        name: text.clone(),
+                        name: Arc::from(text.as_str()),
                     })
                 } else {
                     None
@@ -751,7 +752,7 @@ mod tests {
             Stmt::Assign { rhs: Expr::Symbol { addr, kind, name }, .. } => {
                 assert_eq!(*addr, 0x402010);
                 assert_eq!(*kind, SymbolKind::String);
-                assert_eq!(name, "hello world");
+                assert_eq!(&**name, "hello world");
             }
             other => panic!("expected Symbol, got {:?}", other),
         }

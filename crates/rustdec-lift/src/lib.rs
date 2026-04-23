@@ -204,7 +204,7 @@ fn resolve_constants(func: &mut IrFunction, symbols: &SymbolMap) {
                                     trace!(addr = format_args!("{:#x}", addr),
                                            name = %entry.name,
                                            "resolve_constants: Direct → Named");
-                                    *target = rustdec_ir::CallTarget::Named(entry.name.clone());
+                                    *target = rustdec_ir::CallTarget::Named(Arc::clone(&entry.name));
                                 }
                             }
                         }
@@ -254,7 +254,7 @@ fn symbol_expr(addr: u64, entry: &rustdec_loader::SymbolEntry) -> Expr {
         SymbolMapKind::Function => SymbolKind::Function,
         SymbolMapKind::Global   => SymbolKind::Global,
     };
-    Expr::Symbol { addr, kind, name: entry.name.clone() }
+    Expr::Symbol { addr, kind, name: Arc::clone(&entry.name) }
 }
 
 // ── Constant folding helpers ──────────────────────────────────────────────────

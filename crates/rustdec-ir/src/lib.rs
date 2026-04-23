@@ -155,7 +155,7 @@ pub enum Expr {
     /// - `kind`: semantic classification; drives codegen output.
     /// - `name`: for `String` — decoded text content;
     ///           for `Function` / `Global` — the symbol identifier.
-    Symbol { addr: u64, kind: SymbolKind, name: String },
+    Symbol { addr: u64, kind: SymbolKind, name: Arc<str> },
     /// Indexed access into a named stack array: `name[index]`.
     ///
     /// Produced by the array-recognition pass in `rustdec-lift` when a
@@ -170,7 +170,7 @@ pub enum CallTarget {
     /// Indirect call through a computed value.
     Indirect(Value),
     /// Call to a named import/symbol.
-    Named(String),
+    Named(Arc<str>),
 }
 
 // ── Statements ────────────────────────────────────────────────────────────────

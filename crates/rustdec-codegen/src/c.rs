@@ -553,7 +553,7 @@ impl CBackend {
                 // The lifter emits `__syscall(nr, rdi, rsi, rdx, r10, r8, r9)`.
                 // We look up the nr (args[0]) and emit `syscall(SYS_xxx, ...)`.
                 if let CallTarget::Named(n) = target {
-                    if n == "__syscall" {
+                    if &**n == "__syscall" {
                         return self.emit_syscall(args, copies, written, slots, reg_names);
                     }
                 }
@@ -562,7 +562,7 @@ impl CBackend {
                     CallTarget::Direct(a)   => (format!("sub_{a:x}"), None),
                     CallTarget::Named(n)    => {
                         let sig = libc_signatures::lookup(n);
-                        (n.clone(), sig)
+                        (n.to_string(), sig)
                     }
                     CallTarget::Indirect(v) => {
                         let r = resolve(v, copies);
@@ -637,8 +637,8 @@ impl CBackend {
 
             Expr::Symbol { kind, name, .. } => match kind {
                 SymbolKind::String   => format!("\"{}\"", escape_c_string(name)),
-                SymbolKind::Function => name.clone(),
-                SymbolKind::Global   => name.clone(),
+                SymbolKind::Function => name.to_string(),
+                SymbolKind::Global   => name.to_string(),
             },
 
             Expr::ArrayAccess { name, index, .. } => {
